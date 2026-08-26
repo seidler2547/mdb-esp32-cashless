@@ -1,5 +1,6 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
@@ -16,6 +17,7 @@
 #include "network.h"
 #include "modem.h"
 #include "provision.h"
+#include "mdb_debug.h"
 
 #define TAG "webui"
 
@@ -466,6 +468,126 @@ static esp_err_t wifi_scan_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* ---------- MDB bus debugging ----------
+ *
+ * The same numbers the MQTT heartbeat publishes, plus the raw byte trace,
+ * reachable straight from the SoftAP. That matters because an MDB fault and
+ * a missing uplink often arrive together: a device that cannot reach the
+ * broker still has everything needed to explain why the vending machine is
+ * ignoring it. MQTT config command 0x36 brings the SoftAP up on demand for
+ * exactly this, and on cellular boards it is up permanently anyway.
+ */
+
+#define MDB_HTTP_BUS_LEN     768
+#define MDB_HTTP_DIAG_LEN   1024
+#define MDB_HTTP_TRACE_LEN  4096
+
+/* GET /api/v1/mdb/diag — counters, address map and verdict as JSON. */
+static esp_err_t mdb_diag_get_handler(httpd_req_t *req) {
+    char *bus  = malloc(MDB_HTTP_BUS_LEN);
+    char *body = malloc(MDB_HTTP_DIAG_LEN);
+    if (!bus || !body) {
+        free(bus);
+        free(body);
+        return send_err_json(req, "out of memory");
+    }
+
+    if (mdb_debug_json(bus, MDB_HTTP_BUS_LEN) == 0) strcpy(bus, "{}");
+
+    snprintf(body, MDB_HTTP_DIAG_LEN,
+        "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,"
+        "\"lastCmd\":\"%s\",\"vmcLevel\":%u,\"traceEntries\":%u,\"snapshot\":%s,\"bus\":%s}",
+        mdb_state_name(),
+        mdb_configured_address(),
+        (unsigned long) mdb_poll_total(),
+        (unsigned long) mdb_checksum_error_total(),
+        mdb_last_command(),
+        mdb_vmc_level(),
+        (unsigned) mdb_debug_trace_count(),
+        mdb_debug_snapshot_ready() ? "true" : "false",
+        bus);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+
+    free(body);
+    free(bus);
+    return ESP_OK;
+}
+
+/* GET /api/v1/mdb/trace — the byte trace as plain text, with the legend
+ * inline so it is readable on a phone standing in front of the machine. */
+static esp_err_t mdb_trace_get_handler(httpd_req_t *req) {
+
+    char header[384];
+    snprintf(header, sizeof(header),
+        "# MDB bus trace - oldest first, newest last\n"
+        "#   *XX  mode bit set: VMC address byte, or ACK 00 / RET AA / NAK FF\n"
+        "#   >XX  transmitted by this device\n"
+        "#   XX!  framing error - the stop bit sampled low\n"
+        "#   /N   gap of N ms before the next byte\n"
+        "# own address 0x%02X, state %s, verdict %s, %u entries held\n\n",
+        mdb_configured_address(), mdb_state_name(), mdb_debug_verdict(),
+        (unsigned) mdb_debug_trace_count());
+
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr_chunk(req, header);
+
+    char *buf = malloc(MDB_HTTP_TRACE_LEN);
+    if (buf) {
+        if (mdb_debug_trace_render(buf, MDB_HTTP_TRACE_LEN, 0) > 0) {
+            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk(req, "\n");
+        } else {
+            httpd_resp_sendstr_chunk(req, "(empty - debug level 0, or no bus traffic yet)\n");
+        }
+
+        if (mdb_debug_snapshot_ready() &&
+            mdb_debug_snapshot_render(buf, MDB_HTTP_TRACE_LEN) > 0) {
+            char sub[96];
+            snprintf(sub, sizeof(sub), "\n# frozen snapshot, cause: %s\n",
+                     mdb_debug_snapshot_cause());
+            httpd_resp_sendstr_chunk(req, sub);
+            httpd_resp_sendstr_chunk(req, buf);
+            httpd_resp_sendstr_chunk(req, "\n");
+        }
+        free(buf);
+    }
+
+    httpd_resp_sendstr_chunk(req, NULL);   /* terminate the chunked response */
+    return ESP_OK;
+}
+
+/* POST /api/v1/mdb/debug  body: {"level": 0-3} and/or {"reset": true}
+ *   level: 0 counters, 1 +trace, 2 +error snapshots, 3 +serial dumps.
+ *          Persisted to NVS so it survives the reboots that field
+ *          debugging involves.
+ *   reset: clears the counters, the address map and the trace. */
+static esp_err_t mdb_debug_post_handler(httpd_req_t *req) {
+    char buf[192];
+    if (recv_json_body(req, buf, sizeof(buf)) != ESP_OK) return ESP_OK;
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return send_err_json(req, "invalid JSON");
+
+    cJSON *jlevel = cJSON_GetObjectItem(root, "level");
+    cJSON *jreset = cJSON_GetObjectItem(root, "reset");
+
+    if (jlevel && cJSON_IsNumber(jlevel)) {
+        int lvl = (int) jlevel->valuedouble;
+        if (lvl < 0 || lvl > MDB_DBG_VERBOSE) {
+            cJSON_Delete(root);
+            return send_err_json(req, "level must be 0-3");
+        }
+        mdb_debug_apply_level((uint8_t) lvl, true);
+    }
+
+    if (jreset && cJSON_IsTrue(jreset)) mdb_reset_counters();
+
+    cJSON_Delete(root);
+    return send_ok(req);
+}
+
 static esp_err_t captive_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "Captive portal redirect: %s", req->uri);
     httpd_resp_set_status(req, "302 Found");
@@ -525,9 +647,9 @@ void start_rest_server(void) {
     if (rest_server != NULL) return;
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    /* Allow more handler slots than the default 8 — we register seven
+    /* Allow more handler slots than the default 8 — we register ten
      * exact API URIs plus a clutch of captive-portal probe paths. */
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;
     httpd_start(&rest_server, &config);
 
     static const httpd_uri_t uris[] = {
@@ -538,6 +660,9 @@ void start_rest_server(void) {
         { .uri = "/api/v1/cellular/configure", .method = HTTP_POST, .handler = cellular_configure_handler },
         { .uri = "/api/v1/wifi/configure",     .method = HTTP_POST, .handler = wifi_configure_handler     },
         { .uri = "/api/v1/claim",              .method = HTTP_POST, .handler = claim_handler              },
+        { .uri = "/api/v1/mdb/diag",           .method = HTTP_GET,  .handler = mdb_diag_get_handler       },
+        { .uri = "/api/v1/mdb/trace",          .method = HTTP_GET,  .handler = mdb_trace_get_handler      },
+        { .uri = "/api/v1/mdb/debug",          .method = HTTP_POST, .handler = mdb_debug_post_handler     },
 
         /* OS captive-portal probe paths.
          *

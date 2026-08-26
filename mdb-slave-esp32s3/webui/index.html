@@ -70,6 +70,17 @@
     .scan-btn:hover{background:#0F172A}
     .scan-btn:disabled{color:#94A3B8;border-color:#334155;background:transparent}
     .scanning-msg{text-align:center;padding:14px;color:#64748B;font-size:12px}
+    /* MDB bus diagnostics panel */
+    .mdb-head{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+    .mdb-head h2{margin:0;flex:1}
+    .mdb-chev{color:#94A3B8;font-size:12px;width:12px;text-align:center}
+    .mdb-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font-size:12px;margin-top:12px}
+    .mdb-grid dt{color:#94A3B8}
+    .mdb-grid dd{color:#CBD5E1;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;overflow-wrap:anywhere;white-space:pre-line}
+    .mdb-grid dd.bad{color:#F87171}
+    .mdb-trace{max-height:230px;overflow:auto;background:#0F172A;border:1px solid #334155;border-radius:6px;padding:10px;margin-top:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:#CBD5E1}
+    .mdb-actions{display:flex;gap:8px;margin-top:12px}
+    .mdb-actions button{margin-top:0}
     /* Status banner uplink details */
     .uplink-details{margin-top:8px;padding-top:8px;border-top:1px solid #334155;font-size:12px;color:#94A3B8;display:grid;grid-template-columns:auto 1fr;gap:4px 10px}
     .uplink-details dt{font-weight:500;color:#94A3B8}
@@ -110,6 +121,36 @@
 
   <!-- ============ DYNAMIC VIEW MOUNT POINT ============ -->
   <div id="view"></div>
+
+  <!-- ============ MDB BUS DIAGNOSTICS ============ -->
+  <div class="panel" id="mdb_panel" style="display:none">
+    <div class="mdb-head" id="mdb_toggle">
+      <span class="icon">&#128268;</span>
+      <h2>MDB bus</h2>
+      <span class="badge" id="mdb_badge">checking&hellip;</span>
+      <span class="mdb-chev" id="mdb_chev">&#9656;</span>
+    </div>
+
+    <div id="mdb_body" style="display:none">
+      <div class="info-banner" id="mdb_verdict"></div>
+      <dl class="mdb-grid" id="mdb_counters"></dl>
+
+      <label style="margin-top:16px">Debug level</label>
+      <select id="mdb_level">
+        <option value="0">0 &mdash; counters only</option>
+        <option value="1">1 &mdash; + byte trace</option>
+        <option value="2">2 &mdash; + snapshots on bus errors</option>
+        <option value="3">3 &mdash; + periodic serial dumps</option>
+      </select>
+      <div class="hint">Stored on the device, so it survives a restart.</div>
+
+      <div class="mdb-actions">
+        <button type="button" class="ghost" id="mdb_trace_btn">Load trace</button>
+        <button type="button" class="ghost" id="mdb_reset_btn">Reset counters</button>
+      </div>
+      <pre class="mdb-trace" id="mdb_trace" style="display:none"></pre>
+    </div>
+  </div>
 
 </div>
 
@@ -891,9 +932,211 @@
     });
   }
 
+  /* ---------- MDB bus diagnostics ----------
+   *
+   * Reads /api/v1/mdb/diag. The panel stays hidden until the device answers,
+   * so a portal served by firmware without the endpoint simply looks the way
+   * it always did. Collapsed by default — this is a setup wizard first — and
+   * polled every 3 s while open, so counters visibly move while somebody is
+   * re-seating the MDB harness.
+   */
+  var mdbOpen = false;
+  var mdbBusy = false;
+
+  /* MDB/ICP 4.2 section 2.3. Naming the addresses is most of the diagnosis:
+   * "the machine polls 0x30" means nothing, "it polls the bill validator but
+   * never a cashless device" means the reader was never enabled. */
+  var MDB_ADDR_NAMES = {
+    "08": "Changer", "10": "Cashless #1", "18": "Comms gateway",
+    "20": "Display", "28": "Energy mgmt", "30": "Bill validator",
+    "40": "Satellite #1", "48": "Satellite #2", "50": "Satellite #3",
+    "58": "Coin hopper 1", "60": "Cashless #2", "68": "Age verification",
+    "70": "Coin hopper 2"
+  };
+
+  function mdbVerdict(d) {
+    var bus = d.bus || {};
+    switch (bus.verdict) {
+      case "ok":
+        return { badge: "ok", cls: "",
+                 text: "The vending machine is polling this reader at " + d.addr + "." };
+      case "wrong_addr":
+        return { badge: "err", cls: "warn",
+                 text: "The machine polls " + (bus.hint || "the other cashless address") +
+                       " and never " + d.addr + ". It is configured for the other cashless " +
+                       "device — switch this reader to " +
+                       (bus.hint === "0x60" ? "Cashless #2" : "Cashless #1") + "." };
+      case "not_enabled":
+        return { badge: "err", cls: "warn",
+                 text: "The bus is busy, but the machine never polls a cashless device at " +
+                       "all. Enable the card reader in the vending machine's own setup menu." };
+      case "bus_silent":
+        return { badge: "err", cls: "warn",
+                 text: "Traffic stopped. The machine is powered down, the MDB harness came " +
+                       "loose, or the receive opto-coupler failed." };
+      case "no_rx":
+        return { badge: "err", cls: "warn",
+                 text: "Nothing has ever arrived on the bus. Check the MDB cable and that " +
+                       "the machine is switched on." };
+      default:
+        return { badge: "", cls: "", text: "No reading yet." };
+    }
+  }
+
+  function mdbAddrSummary(map) {
+    var out = [];
+    Object.keys(map || {}).forEach(function (k) {
+      var name = MDB_ADDR_NAMES[k];
+      out.push("0x" + k + (name ? " " + name : "") + " \u00D7" + map[k]);
+    });
+    return out.length ? out.join("\n") : "\u2014";
+  }
+
+  function mdbRow(dl, label, value, bad) {
+    var dt = document.createElement("dt");
+    dt.textContent = label;
+    var dd = document.createElement("dd");
+    dd.textContent = value;
+    if (bad) dd.className = "bad";
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  }
+
+  /* A green verdict only means the VMC is addressing us — it says nothing
+   * about how well the bytes are arriving. Surface quality problems in the
+   * badge too, or a reader with 37 checksum errors looks perfectly healthy. */
+  function mdbQualityProblems(bus) {
+    var p = [];
+    if (bus.frmErr) p.push("framing errors");
+    if (bus.chkErr) p.push("checksum errors");
+    if (bus.shortBlk || bus.gapErr) p.push("lost bytes");
+    if (bus.nak || bus.ret) p.push("answers the machine rejected");
+    if (bus.rspMaxUs > 5000) p.push("answers past the 5 ms deadline");
+    if (bus.sil) p.push("dropouts");
+    return p;
+  }
+
+  function renderMdb(d) {
+    var bus = d.bus || {};
+    var v = mdbVerdict(d);
+    var label = bus.verdict || "unknown";
+
+    if (v.badge === "ok") {
+      var problems = mdbQualityProblems(bus);
+      if (problems.length) {
+        v.badge = "warn";
+        v.cls = "warn";
+        label = "bus errors";
+        v.text += " Signal quality is poor, though: " + problems.join(", ") +
+                  ". Check the harness, the grounding and the cable run, then " +
+                  "load the trace and look for ! marks and long gaps mid-block.";
+      }
+    }
+
+    var badge = el("mdb_badge");
+    badge.textContent = label;
+    badge.className = "badge" + (v.badge ? " " + v.badge : "");
+
+    if (!mdbOpen) return;
+
+    var banner = el("mdb_verdict");
+    banner.textContent = v.text;
+    banner.className = "info-banner" + (v.cls ? " " + v.cls : "");
+
+    var dl = el("mdb_counters");
+    dl.innerHTML = "";
+    mdbRow(dl, "State", d.state + " (VMC level " + d.vmcLevel + ")");
+    mdbRow(dl, "Our address", d.addr);
+    mdbRow(dl, "Polls to us", String(d.polls) +
+           (d.polls && bus.lastMineMs != null ? "  (last " + bus.lastMineMs + " ms ago)" : ""),
+           !d.polls);
+    mdbRow(dl, "Last command", d.lastCmd);
+    mdbRow(dl, "Checksum errors", String(d.chkErr), d.chkErr > 0);
+    mdbRow(dl, "Framing errors", String(bus.frmErr), bus.frmErr > 0);
+    mdbRow(dl, "Lost bytes", String(bus.shortBlk) + " blocks, " + bus.gapErr + " gaps",
+           bus.shortBlk > 0 || bus.gapErr > 0);
+    mdbRow(dl, "ACK / NAK / RET", bus.ack + " / " + bus.nak + " / " + bus.ret,
+           bus.nak > 0 || bus.ret > 0);
+    mdbRow(dl, "Blocks sent", bus.txBlk + " data, " + bus.txAck + " bare ACK");
+    mdbRow(dl, "Response time",
+           bus.rspMaxUs ? bus.rspUs + " \u00B5s (worst " + bus.rspMaxUs + " \u00B5s)" : "\u2014",
+           bus.rspMaxUs > 5000);
+    mdbRow(dl, "Silent periods", bus.sil + " (longest " + bus.maxSilMs + " ms)", bus.sil > 0);
+    mdbRow(dl, "Addresses seen", mdbAddrSummary(bus.addr));
+    mdbRow(dl, "Trace held", d.traceEntries + " bytes" + (d.snapshot ? " + error snapshot" : ""));
+
+    var sel = el("mdb_level");
+    if (sel && document.activeElement !== sel) sel.value = String(bus.lvl);
+  }
+
+  function fetchMdb() {
+    fetch("/api/v1/mdb/diag").then(function (r) {
+      if (!r.ok) throw new Error("unavailable");
+      return r.json();
+    }).then(function (d) {
+      show(el("mdb_panel"));
+      renderMdb(d);
+    }).catch(function () {
+      /* endpoint missing (older firmware) or SoftAP dropped — stay hidden */
+    });
+  }
+
+  function loadMdbTrace() {
+    var pre = el("mdb_trace");
+    var btn = el("mdb_trace_btn");
+    btn.disabled = true;
+    btn.textContent = "Loading\u2026";
+    fetch("/api/v1/mdb/trace").then(function (r) { return r.text(); }).then(function (t) {
+      pre.textContent = t;
+      show(pre);
+    }).catch(function () {
+      pre.textContent = "Could not read the trace.";
+      show(pre);
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = "Reload trace";
+    });
+  }
+
+  function postMdbDebug(body, btn, label) {
+    if (mdbBusy) return;
+    mdbBusy = true;
+    if (btn) btn.disabled = true;
+    postJson("/api/v1/mdb/debug", body).then(function () {
+      fetchMdb();
+    }).catch(function () {
+      /* ignore — the next poll shows the real state either way */
+    }).then(function () {
+      mdbBusy = false;
+      if (btn) { btn.disabled = false; if (label) btn.textContent = label; }
+    });
+  }
+
+  el("mdb_toggle").addEventListener("click", function () {
+    mdbOpen = !mdbOpen;
+    el("mdb_chev").textContent = mdbOpen ? "\u25BE" : "\u25B8";
+    (mdbOpen ? show : hide)(el("mdb_body"));
+    if (mdbOpen) fetchMdb();
+  });
+
+  el("mdb_level").addEventListener("change", function () {
+    postMdbDebug({ level: parseInt(this.value, 10) }, null, null);
+  });
+
+  el("mdb_trace_btn").addEventListener("click", loadMdbTrace);
+
+  el("mdb_reset_btn").addEventListener("click", function () {
+    var btn = this;
+    btn.textContent = "Reset\u2026";
+    postMdbDebug({ reset: true }, btn, "Reset counters");
+    hide(el("mdb_trace"));
+  });
+
   /* Boot */
   fetchInfo();
   setInterval(fetchInfo, 2000);
+  fetchMdb();
+  setInterval(function () { if (mdbOpen) fetchMdb(); }, 3000);
 </script>
 
 </body>

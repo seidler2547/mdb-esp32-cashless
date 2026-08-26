@@ -3,6 +3,22 @@ This project aims to implement an MDB (Multi-Drop Bus) cashless device using an 
 
 ![MDB Cashless Device](mdb-slave-esp32s3_pcb_v3.jpg)
 
+## Diagnosing the MDB bus
+
+The firmware watches every byte on the link and reduces it to a verdict
+(`ok`, `wrong_addr`, `not_enabled`, `bus_silent`, `no_rx`), a set of bus
+counters, a per-address command map and a rolling byte trace — readable over
+MQTT, over the captive portal's **MDB bus** panel, and on the serial console.
+See **[docs/mdb-bus-debugging.md](../docs/mdb-bus-debugging.md)** for the
+field guide: what each counter means, how to read a trace, the remote
+commands, and the signatures of the common failures.
+
+The analysis code is unit-tested on the host, no board required:
+
+```sh
+test/run.sh
+```
+
 ## ⚠️ Cellular (SIM7080G) board not plug-and-play
 
 The modem driver in `main/modem.c` targets the LilyGo T-SIM7080G-S3 devkit

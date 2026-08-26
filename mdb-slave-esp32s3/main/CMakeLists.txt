@@ -1,4 +1,5 @@
 set(srcs "mdb-slave-esp32s3.c"
+        "mdb_debug.c"
         "webui_server.c"
         "nimble.c"
         "sale_queue.c"

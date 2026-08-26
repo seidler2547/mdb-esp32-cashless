@@ -83,6 +83,31 @@ menu "MDB Cashless Device"
         default 96 if CASHLESS_ADDR_1
         default 16 if CASHLESS_ADDR_2
 
+    config MDB_DEBUG_TRACE_DEPTH
+        int "Bus trace depth (9-bit words, 0 = disable)"
+        default 256
+        range 0 1024
+        help
+            Number of MDB bus bytes kept in the rolling trace ring used by
+            /api/v1/mdb/trace, the MQTT trace dump and the automatic
+            snapshots taken around bus errors. Each entry costs 8 bytes of
+            RAM, so the default 256 entries (~0.25 s of continuous bus
+            traffic) costs 2 KiB. Set to 0 to compile the trace out and
+            keep only the counters.
+
+    config MDB_DEBUG_DEFAULT_LEVEL
+        int "Default MDB debug level (0-3)"
+        default 2
+        range 0 3
+        help
+            Level the firmware starts at when NVS holds no `mdb_dbg` key:
+            0 = counters, address map and verdict only
+            1 = + rolling byte trace
+            2 = + automatic trace snapshot around bus errors (recommended)
+            3 = + periodic trace dump to the serial console
+            The level is settable at runtime (MQTT config cmd 0x34 or
+            POST /api/v1/mdb/debug) and is then persisted in NVS.
+
 endmenu # MDB Cashless Device
 
 menu "SIM7080G"

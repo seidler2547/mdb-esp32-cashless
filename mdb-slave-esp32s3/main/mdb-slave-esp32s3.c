@@ -19,6 +19,7 @@
 #include <mqtt_client.h>
 #include <nvs_flash.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <esp_sntp.h>
 #include <time.h>
@@ -35,6 +36,7 @@
 #include "webui_server.h"
 #include "sale_queue.h"
 #include "network.h"
+#include "mdb_debug.h"
 
 #include "esp_system.h"
 #include "esp_http_client.h"
@@ -71,6 +73,12 @@
 #define ACK 	0x00  // Acknowledgment / Checksum correct
 #define RET 	0xAA  // Retransmit previously sent data. Only VMC can send this
 #define NAK 	0xFF  // Negative acknowledgment
+
+// A VMC polls its peripherals continuously, so this much silence on the bus
+// already means nobody is talking: machine powered down, harness unplugged,
+// or the receive opto-coupler has failed. Used as the main loop's read
+// timeout so the firmware can say so instead of waiting forever.
+#define MDB_BUS_IDLE_US		250000
 
 // Bit masks for MDB operations
 #define BIT_MODE_SET 	0b100000000
@@ -275,6 +283,31 @@ static uint32_t mdb_checksum_errors = 0;
 static const char *mdb_last_cmd = "none";
 static machine_state_t mdb_prev_state = INACTIVE_STATE;
 static void publish_mdb_diag(void); // forward declaration
+static void publish_mdb_trace(const char *cause); // forward declaration
+
+/* Deferred MDB diagnostics publish.
+ *
+ * publish_mdb_diag() takes the MQTT publish mutex and hands a message to the
+ * client — hundreds of microseconds on a good day, up to a second when the
+ * mutex is contended. It used to be called straight from the MDB task on
+ * every state change, which put that delay between the VMC's POLL and our
+ * answer to it. MDB/ICP 4.2 gives a peripheral 5ms to respond, so a
+ * contended publish (or the 90-character log line next to it, ~8ms at
+ * 115200 baud) could push the answer past the deadline and produce exactly
+ * the symptom this firmware is meant to diagnose: a VMC that NAKs, re-polls
+ * and eventually resets the reader.
+ *
+ * The bus task now only raises a flag once its answer is on the wire; the
+ * esp_timer task does the logging and the publishing. */
+static esp_timer_handle_t mdb_diag_defer_timer = NULL;
+static volatile bool mdb_diag_pending = false;        /* set inside the bus loop     */
+static machine_state_t mdb_diag_from_state = INACTIVE_STATE;
+
+static void request_mdb_diag_publish(void) {
+    if (!mdb_diag_defer_timer) return;
+    esp_timer_stop(mdb_diag_defer_timer);   /* no-op when idle; restarts the window */
+    esp_timer_start_once(mdb_diag_defer_timer, 50 * 1000);
+}
 
 // Thread-safe MQTT publish wrapper — protects esp_mqtt_client_publish()
 // which is called from multiple FreeRTOS tasks (MDB, BLE, timers, sale drain).
@@ -364,18 +397,56 @@ static inline void mdb_resync(void) {
 	}
 }
 
-uint16_t read_9(uint8_t *checksum) {
+/* ---------- MDB bit-bang primitives ----------
+ *
+ * These four helpers are the only places where bytes cross the bus, which
+ * makes them the only place the bus has to be instrumented. Everything they
+ * hand to mdb_debug is passive bookkeeping — no logging, no allocation and
+ * no locking happens inside a critical section.
+ */
+
+// Busy-wait for the falling edge that starts a byte.
+//
+// timeout_us == 0 keeps the original unbounded tight loop: sub-microsecond
+// edge detection, which is what every byte inside a command block gets. With
+// a timeout the loop checks the clock every 32 spins, costing at most ~1µs of
+// extra detection latency — far inside the ±52µs sampling margin at 9600
+// baud — and letting the caller notice a bus that has gone quiet.
+//
+// Returns 0 when a start bit arrived, -1 on timeout.
+static inline int mdb_wait_start(uint32_t timeout_us) {
+
+	if (timeout_us == 0) {
+		while (gpio_get_level(PIN_MDB_RX))
+			;
+		return 0;
+	}
+
+	int64_t deadline = esp_timer_get_time() + timeout_us;
+	uint32_t spins = 0;
+
+	while (gpio_get_level(PIN_MDB_RX)) {
+		if ((++spins & 0x1F) == 0 && esp_timer_get_time() >= deadline)
+			return -1; // no data arrived
+	}
+	return 0;
+}
+
+// Sample the nine data bits of a byte whose start bit has just begun, then
+// the stop bit. *stop_ok comes back false when the line is still low where
+// the stop bit belongs — a framing error, which on this bus means a baud
+// mismatch, electrical noise, or two devices transmitting at once. Counting
+// those separates "the VMC sent something we didn't like" from "the bits
+// never arrived intact in the first place".
+//
+// Enter critical section: disable interrupts on this core so that
+// WiFi/MQTT/BLE tasks cannot preempt the timing-sensitive bit sampling.
+// The critical section lasts ~1.1ms (11 bits at 9600 baud) which is safe
+// for the interrupt watchdog (timeout >> 1ms) and only affects Core 1.
+static inline uint16_t mdb_sample_word(bool *stop_ok) {
 
 	uint16_t coming_read = 0;
 
-	// Wait start bit (idle, interruptible — no timing constraint here)
-	while (gpio_get_level(PIN_MDB_RX))
-		;
-
-	// Enter critical section: disable interrupts on this core so that
-	// WiFi/MQTT/BLE tasks cannot preempt the timing-sensitive bit sampling.
-	// The critical section lasts ~1.1ms (11 bits at 9600 baud) which is safe
-	// for the interrupt watchdog (timeout >> 1ms) and only affects Core 1.
 	portENTER_CRITICAL(&mdb_mux);
 
 	ets_delay_us(104);
@@ -387,9 +458,25 @@ uint16_t read_9(uint8_t *checksum) {
 	}
 
 	// The loop's trailing delay lands us in the middle of the stop bit.
-	bool stop_ok = gpio_get_level(PIN_MDB_RX) != 0;
+	bool stop = gpio_get_level(PIN_MDB_RX) != 0;
 
 	portEXIT_CRITICAL(&mdb_mux);
+
+	if (stop_ok)
+		*stop_ok = stop;
+
+	return coming_read;
+}
+
+uint16_t read_9(uint8_t *checksum) {
+
+	// Wait start bit (idle, interruptible — no timing constraint here)
+	mdb_wait_start(0);
+
+	bool stop_ok = true;
+	uint16_t coming_read = mdb_sample_word(&stop_ok);
+
+	mdb_debug_rx_byte(coming_read, stop_ok);
 
 	if (!stop_ok)
 		mdb_resync();
@@ -401,33 +488,16 @@ uint16_t read_9(uint8_t *checksum) {
 }
 
 // Timed version of read_9: returns -1 if no start bit arrives within timeout_us.
-// Used to drain remaining bytes from the bus after unrecognized commands.
+// Used to drain remaining bytes from the bus after unrecognized commands, and
+// by the main loop to notice a bus that has stopped carrying traffic at all.
 int32_t read_9_timeout(uint8_t *checksum, uint32_t timeout_us) {
 
-	uint16_t coming_read = 0;
+	if (mdb_wait_start(timeout_us) < 0) return -1; // no data arrived
 
-	// Wait for start bit with timeout (idle, interruptible)
-	uint32_t waited = 0;
-	while (gpio_get_level(PIN_MDB_RX)) {
-		ets_delay_us(10);
-		waited += 10;
-		if (waited >= timeout_us) return -1; // no data arrived
-	}
+	bool stop_ok = true;
+	uint16_t coming_read = mdb_sample_word(&stop_ok);
 
-	// Critical section for bit sampling (same as read_9)
-	portENTER_CRITICAL(&mdb_mux);
-
-	ets_delay_us(104);
-
-	ets_delay_us(52);
-	for (int x = 0; x < 9; x++) {
-		coming_read |= (gpio_get_level(PIN_MDB_RX) << x);
-		ets_delay_us(104);
-	}
-
-	bool stop_ok = gpio_get_level(PIN_MDB_RX) != 0;
-
-	portEXIT_CRITICAL(&mdb_mux);
+	mdb_debug_rx_byte(coming_read, stop_ok);
 
 	if (!stop_ok)
 		mdb_resync();
@@ -471,6 +541,12 @@ void write_payload_9(uint8_t *mdb_payload, uint8_t length) {
 
 	uint8_t checksum = 0x00;
 
+	// Taken before the first start bit: mdb_debug turns it into the delay
+	// between the VMC's command and our answer. MDB/ICP 4.2 gives a
+	// peripheral 5ms to respond, so a rspMaxUs anywhere near that is the
+	// reason a VMC is NAKing or re-addressing us.
+	int64_t tx_start_us = esp_timer_get_time();
+
 	portENTER_CRITICAL(&mdb_mux);
 
 	// Calculate checksum
@@ -487,6 +563,8 @@ void write_payload_9(uint8_t *mdb_payload, uint8_t length) {
 
 	// Release the bus — back to high-Z so we don't interfere with other peripherals
 	gpio_set_direction(PIN_MDB_TX, GPIO_MODE_INPUT);
+
+	mdb_debug_tx_block(mdb_payload, length, checksum, tx_start_us);
 }
 
 void xorEncodeWithPasskey(uint8_t cmd, uint16_t itemPrice, uint16_t itemNumber, uint16_t paxCounter, uint8_t *payload);
@@ -496,6 +574,7 @@ uint8_t xorDecodeWithPasskey(uint16_t *itemPrice, uint16_t *itemNumber, uint8_t 
 // unrecognized command to prevent desynchronization. Reads until the bus
 // is idle for 5ms (no more bytes) or a new address byte (mode bit) arrives.
 static void mdb_drain_bus(void) {
+	mdb_debug_note_drain();
 	for (uint8_t i = 0; i < 36; i++) {
 		int32_t b = read_9_timeout(NULL, 1500);
 		if (b < 0) break;           // bus idle
@@ -534,13 +613,42 @@ void vTaskMdbEvent(void *pvParameters) {
 	uint16_t sniff_itemNumber = 0;
 #endif
 
+	// Bus-silence bookkeeping (see MDB_BUS_IDLE_US).
+	int64_t bus_quiet_since  = 0;
+	int64_t bus_quiet_logged = 0;
+
 	for (;;) {
 
 		// In the MDB (Multi-Drop Bus) protocol, the last byte of a command or data packet is a checksum.
 		uint8_t checksum = 0x00;
 
-		// Read from MDB and check if the mode bit is set
-		uint16_t coming_read = read_9(&checksum);
+		// Read from MDB and check if the mode bit is set.
+		//
+		// The bounded wait is the same busy loop as before for a live bus —
+		// it only adds an exit when nothing arrives at all, which turns the
+		// most common field report ("the reader does nothing") from silence
+		// into a logged, published diagnosis.
+		int32_t next_word = read_9_timeout(&checksum, MDB_BUS_IDLE_US);
+
+		if (next_word < 0) {
+			int64_t now = esp_timer_get_time();
+			if (!bus_quiet_since) bus_quiet_since = now - MDB_BUS_IDLE_US;
+
+			mdb_debug_note_silence(MDB_BUS_IDLE_US);
+
+			if (now - bus_quiet_logged > 30 * 1000000LL) {
+				bus_quiet_logged = now;
+				ESP_LOGW(TAG, "MDB BUS: silent for %llus — verdict=%s, our addr=0x%02X, polls=%lu",
+					(unsigned long long) ((now - bus_quiet_since) / 1000000),
+					mdb_debug_verdict(), cashless_device_address, mdb_poll_count);
+			}
+			continue;
+		}
+
+		bus_quiet_since  = 0;
+		bus_quiet_logged = 0;
+
+		uint16_t coming_read = (uint16_t) next_word;
 
 		if (coming_read & BIT_MODE_SET) {
 
@@ -578,7 +686,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 				case RESET: {
 
-                    if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                    if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
                     // Reset during VEND_STATE is interpreted as VEND_SUCCESS
 
@@ -620,7 +728,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						(void) vmcRowsOnDisplay;
 						(void) vmcColumnsOnDisplay;
 
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						// Only trust vmcFeatureLevel after the checksum has verified — otherwise
 						// a bit-flipped byte could persistently set a wrong level until the next
@@ -661,7 +769,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						(void) maxPrice;
 						(void) minPrice;
 
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "SETUP:MAX_MIN_PRICES";
 						ESP_LOGI( TAG, "MAX_MIN_PRICES");
@@ -670,6 +778,7 @@ void vTaskMdbEvent(void *pvParameters) {
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "SETUP:UNKNOWN";
+						mdb_debug_note_unknown_cmd();
 						ESP_LOGW(TAG, "SETUP: unhandled subcommand, drained bus");
 						break;
 					}
@@ -679,24 +788,18 @@ void vTaskMdbEvent(void *pvParameters) {
 				}
 				case POLL: {
 
-				    if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+				    if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 					mdb_poll_count++;
 
-					// Log and publish state changes immediately
+					// Note the state change here, report it once the answer to
+					// this POLL is on the wire — see request_mdb_diag_publish().
+					// The periodic "MDB DIAG" summary moved to the heartbeat
+					// timer for the same reason.
 					if (machine_state != mdb_prev_state) {
-						ESP_LOGW(TAG, "MDB STATE: %s -> %s (polls=%lu, chkErr=%lu)",
-							machine_state_name(mdb_prev_state), machine_state_name(machine_state),
-							mdb_poll_count, mdb_checksum_errors);
+						mdb_diag_from_state = mdb_prev_state;
 						mdb_prev_state = machine_state;
-						publish_mdb_diag();
-					}
-
-					// Periodic log every 500 polls (~every 50s at typical VMC rate)
-					if (mdb_poll_count % 500 == 0) {
-						ESP_LOGI(TAG, "MDB DIAG: state=%s addr=0x%02X polls=%lu chkErr=%lu lastCmd=%s vmcLevel=%u",
-							machine_state_name(machine_state), cashless_device_address,
-							mdb_poll_count, mdb_checksum_errors, mdb_last_cmd, vmc_feature_level);
+						mdb_diag_pending = true;
 					}
 
 					if (cashless_reset_todo) {
@@ -845,7 +948,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						itemPrice = (read_9(&checksum) << 8) | read_9(&checksum);
 						itemNumber = (read_9(&checksum) << 8) | read_9(&checksum);
 
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						machine_state = VEND_STATE;
 						mdb_last_cmd = "VEND_REQUEST";
@@ -870,7 +973,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						break;
 					}
 					case VEND_CANCEL: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_CANCEL";
 						vend_denied_todo = true;
@@ -880,7 +983,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						itemNumber = (read_9(&checksum) << 8) | read_9(&checksum);
 
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_SUCCESS";
 
@@ -941,7 +1044,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						break;
 					}
 					case VEND_FAILURE: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_FAILURE";
 
@@ -960,7 +1063,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						break;
 					}
 					case SESSION_COMPLETE: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "SESSION_COMPLETE";
 						session_end_todo = true;
@@ -979,7 +1082,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						uint16_t itemPrice = (read_9(&checksum) << 8) | read_9(&checksum);
 						uint16_t itemNumber = (read_9(&checksum) << 8) | read_9(&checksum);
 
-						if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+						if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "CASH_SALE";
 
@@ -999,6 +1102,7 @@ void vTaskMdbEvent(void *pvParameters) {
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "VEND:UNKNOWN";
+						mdb_debug_note_unknown_cmd();
 						ESP_LOGW(TAG, "VEND: unhandled subcommand, drained bus");
 						break;
 					}
@@ -1009,7 +1113,7 @@ void vTaskMdbEvent(void *pvParameters) {
 				case READER: {
 					switch (read_9(&checksum)) {
 					case READER_DISABLE: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						machine_state = DISABLED_STATE;
 						mdb_last_cmd = "READER_DISABLE";
@@ -1020,7 +1124,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						break;
 					}
 					case READER_ENABLE: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						machine_state = ENABLED_STATE;
 						mdb_last_cmd = "READER_ENABLE";
@@ -1030,7 +1134,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						break;
 					}
 					case READER_CANCEL: {
-                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_drain_bus(); continue; }
+                        if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "READER_CANCEL";
 						mdb_payload[ 0 ] = 0x08; // Canceled
@@ -1042,6 +1146,7 @@ void vTaskMdbEvent(void *pvParameters) {
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "READER:UNKNOWN";
+						mdb_debug_note_unknown_cmd();
 						ESP_LOGW(TAG, "READER: unhandled subcommand, drained bus");
 						break;
 					}
@@ -1061,7 +1166,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						for (uint8_t x = 0; x < 29; x++) read_9(&checksum);
 
 						if (read_9(NULL) != checksum) {
-							mdb_checksum_errors++;
+							mdb_checksum_errors++; mdb_debug_note_chk_err();
 							ESP_LOGW(TAG, "EXPANSION:REQUEST_ID checksum FAIL");
 							mdb_drain_bus();
 							continue;
@@ -1086,7 +1191,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						for (uint8_t x = 0; x < 4; x++) read_9(&checksum);
 
 						if (read_9(NULL) != checksum) {
-							mdb_checksum_errors++;
+							mdb_checksum_errors++; mdb_debug_note_chk_err();
 							ESP_LOGW(TAG, "EXPANSION:OPT_FEATURE checksum FAIL");
 							mdb_drain_bus();
 							continue;
@@ -1102,6 +1207,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						// bus goes idle to prevent desynchronization.
 						mdb_drain_bus();
 						mdb_last_cmd = "EXPANSION:UNKNOWN";
+						mdb_debug_note_unknown_cmd();
 						ESP_LOGW(TAG, "EXPANSION: unhandled subcommand 0x%02X, drained bus", exp_sub);
 						break;
 					}
@@ -1121,6 +1227,13 @@ void vTaskMdbEvent(void *pvParameters) {
 				if (available_tx > 0) {
 					memcpy(last_tx_payload, mdb_payload, available_tx);
 					last_tx_len = available_tx;
+				}
+
+				// Anything that wants to touch the network waits until the
+				// answer is on the wire, never between command and response.
+				if (mdb_diag_pending) {
+					mdb_diag_pending = false;
+					request_mdb_diag_publish();
 				}
 
 			}
@@ -1936,17 +2049,58 @@ static void ota_update_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-// Publish MDB diagnostics snapshot via MQTT.
-// Called event-driven on state changes and periodically as heartbeat.
+/* ---------- MDB state accessors (see mdb_debug.h) ---------- */
+uint8_t     mdb_configured_address(void)   { return cashless_device_address; }
+const char *mdb_state_name(void)           { return machine_state_name(machine_state); }
+const char *mdb_last_command(void)         { return mdb_last_cmd; }
+uint32_t    mdb_poll_total(void)           { return mdb_poll_count; }
+uint32_t    mdb_checksum_error_total(void) { return mdb_checksum_errors; }
+uint8_t     mdb_vmc_level(void)            { return vmc_feature_level; }
+
+void mdb_reset_counters(void) {
+    mdb_debug_reset();
+    mdb_poll_count = 0;
+    mdb_checksum_errors = 0;
+}
+
+/* Buffer budgets for the two diagnostics messages.
+ *
+ * Both are built on the heap rather than on the caller's stack: they are
+ * produced from the esp_timer task (shared with every other timer callback)
+ * and from the MQTT event task, neither of which has a kilobyte to spare.
+ * The MQTT client's outbound buffer is sized to match in app_main. */
+#define MDB_BUS_JSON_LEN     768
+#define MDB_DIAG_MSG_LEN    1280
+#define MDB_TRACE_TEXT_LEN  1400
+#define MDB_TRACE_MQTT_MAX   220   /* trace entries offered to one MQTT dump */
+
+/* Diagnostics heartbeat, published on /{company}/{device}/mdb-log.
+ *
+ * mqtt-webhook merges the whole object into embeddeds.mdb_diagnostics and
+ * keeps it verbatim in mdb_log.raw on a state change, and only `state` is
+ * mandatory — so the bus counters ride along as a nested "bus" object with
+ * no schema change on either side. Firmware that predates the object simply
+ * doesn't send it. */
 static void publish_mdb_diag(void) {
     if (!mqttClient) return;
 
     char topic[128];
     snprintf(topic, sizeof(topic), "/%s/%s/mdb-log", my_company_id, my_device_id);
 
-    char msg[448];
-    snprintf(msg, sizeof(msg),
-        "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,\"lastCmd\":\"%s\",\"vmcLevel\":%u,\"saleQueue\":{\"pending\":%lu,\"overflow\":%lu,\"lastSeq\":%lu,\"fastPath\":%lu}}",
+    char *msg = malloc(MDB_DIAG_MSG_LEN);
+    char *bus = malloc(MDB_BUS_JSON_LEN);
+    if (!msg || !bus) {
+        free(msg);
+        free(bus);
+        ESP_LOGW(TAG, "MDB DIAG: out of memory, skipping publish");
+        return;
+    }
+
+    if (mdb_debug_json(bus, MDB_BUS_JSON_LEN) == 0) strcpy(bus, "{}");
+
+    int n = snprintf(msg, MDB_DIAG_MSG_LEN,
+        "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,\"lastCmd\":\"%s\",\"vmcLevel\":%u,"
+        "\"saleQueue\":{\"pending\":%lu,\"overflow\":%lu,\"lastSeq\":%lu,\"fastPath\":%lu},\"bus\":%s}",
         machine_state_name(machine_state),
         cashless_device_address,
         mdb_poll_count,
@@ -1956,14 +2110,115 @@ static void publish_mdb_diag(void) {
         (unsigned long) sale_queue_pending_count(),
         (unsigned long) sale_queue_overflow_count(),
         (unsigned long) sale_queue_last_seq(),
-        (unsigned long) sale_queue_fast_path_count());
+        (unsigned long) sale_queue_fast_path_count(),
+        bus);
 
-    mqtt_publish_safe(mqttClient, topic, msg, 0, 0, 0);
+    if (n > 0 && n < MDB_DIAG_MSG_LEN) {
+        mqtt_publish_safe(mqttClient, topic, msg, 0, 0, 0);
+    } else {
+        ESP_LOGW(TAG, "MDB DIAG: payload did not fit (%d bytes), skipping publish", n);
+    }
+
+    free(bus);
+    free(msg);
 }
 
-// esp_timer callback wrapper
-static void mdb_diag_timer_cb(void *arg) {
+/* Byte-level bus dump.
+ *
+ * `cause` names why the dump is being sent ("manual", "boot", ...); passing
+ * NULL publishes the frozen snapshot that a bus error armed instead of the
+ * live ring, and clears it afterwards.
+ *
+ * It goes out on the mdb-log topic like the heartbeat — same forwarder
+ * subscription, same webhook path, no backend change — carrying the
+ * mandatory `state` field plus the rendered trace. Only as many bytes as fit
+ * in one MQTT message are sent; the full ring stays available over HTTP at
+ * /api/v1/mdb/trace whenever the SoftAP is up. */
+static void publish_mdb_trace(const char *cause) {
+    if (!mqttClient) return;
+
+    bool snapshot = (cause == NULL);
+    if (snapshot && !mdb_debug_snapshot_ready()) return;
+
+    char *text = malloc(MDB_TRACE_TEXT_LEN);
+    char *msg  = malloc(MDB_TRACE_TEXT_LEN + 256);
+    if (!text || !msg) {
+        free(text);
+        free(msg);
+        ESP_LOGW(TAG, "MDB TRACE: out of memory, skipping publish");
+        return;
+    }
+
+    size_t len;
+    if (snapshot) {
+        len   = mdb_debug_snapshot_render(text, MDB_TRACE_TEXT_LEN);
+        cause = mdb_debug_snapshot_cause();
+    } else {
+        len = mdb_debug_trace_render(text, MDB_TRACE_TEXT_LEN, MDB_TRACE_MQTT_MAX);
+    }
+
+    /* The rendered notation is hex, '*', '>', '!', '/' and spaces only, so
+     * it needs no JSON escaping. */
+    int n = snprintf(msg, MDB_TRACE_TEXT_LEN + 256,
+        "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"lastCmd\":\"%s\","
+        "\"trace\":{\"cause\":\"%s\",\"snapshot\":%s,\"chars\":%u,\"ring\":%u,\"text\":\"%s\"}}",
+        machine_state_name(machine_state),
+        cashless_device_address,
+        mdb_last_cmd,
+        cause ? cause : "?",
+        snapshot ? "true" : "false",
+        (unsigned) len,
+        (unsigned) mdb_debug_trace_count(),
+        text);
+
+    if (n > 0 && n < MDB_TRACE_TEXT_LEN + 256) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "/%s/%s/mdb-log", my_company_id, my_device_id);
+        mqtt_publish_safe(mqttClient, topic, msg, 0, 0, 0);
+        ESP_LOGW(TAG, "MDB TRACE: published %u chars (cause=%s snapshot=%d)",
+                 (unsigned) len, cause ? cause : "?", snapshot);
+    }
+
+    if (snapshot) mdb_debug_snapshot_clear();
+
+    free(msg);
+    free(text);
+}
+
+/* One-shot, armed by the bus task once its answer to the POLL that caused
+ * the state change is on the wire. */
+static void mdb_diag_defer_cb(void *arg) {
+    ESP_LOGW(TAG, "MDB STATE: %s -> %s (polls=%lu, chkErr=%lu, verdict=%s)",
+        machine_state_name(mdb_diag_from_state), machine_state_name(machine_state),
+        mdb_poll_count, mdb_checksum_errors, mdb_debug_verdict());
     publish_mdb_diag();
+}
+
+/* 5-minute heartbeat. Also carries the periodic summary line that used to be
+ * printed from the bus task every 500 polls, the standing address-mismatch
+ * warning, and any bus postmortem an error left behind. */
+static void mdb_diag_timer_cb(void *arg) {
+
+    ESP_LOGI(TAG, "MDB DIAG: state=%s addr=0x%02X polls=%lu chkErr=%lu lastCmd=%s vmcLevel=%u verdict=%s",
+        machine_state_name(machine_state), cashless_device_address,
+        mdb_poll_count, mdb_checksum_errors, mdb_last_cmd, vmc_feature_level,
+        mdb_debug_verdict());
+
+    /* The VMC is talking to the other cashless address and never to ours:
+     * the machine is set up for cashless device #2 while we answer as #1
+     * (or the reverse). Nothing about the wiring is wrong — one config
+     * command fixes it — but without this line the device just looks dead. */
+    uint8_t hint = mdb_debug_addr_hint();
+    if (hint) {
+        ESP_LOGE(TAG, "MDB ADDR MISMATCH: VMC polls 0x%02X, never our 0x%02X — the machine "
+                      "expects the other cashless device; switch with config cmd 0x31 "
+                      "(mdb_address %u)",
+                 hint, cashless_device_address, hint == 0x10 ? 1 : 2);
+    }
+
+    publish_mdb_diag();
+
+    if (mdb_debug_snapshot_ready()) publish_mdb_trace(NULL);
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -2219,6 +2474,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 		                    vmc_feature_level = 1;
 		                    cashless_reset_todo = true;
 		                    publish_mdb_diag();
+		                    break;
+		                case 0x33: // Publish an MDB bus trace dump now
+		                    ESP_LOGW(TAG, "CONFIG: MDB trace dump requested");
+		                    publish_mdb_diag();
+		                    publish_mdb_trace("manual");
+		                    break;
+		                case 0x34: // Set the MDB debug level (0-3), persisted
+		                    if (configParam <= MDB_DBG_VERBOSE) {
+		                        mdb_debug_apply_level((uint8_t) configParam, true);
+		                        ESP_LOGW(TAG, "CONFIG: MDB debug level set to %u", configParam);
+		                        publish_mdb_diag();
+		                    } else {
+		                        ESP_LOGE(TAG, "CONFIG: invalid MDB debug level %u (must be 0-3)", configParam);
+		                    }
+		                    break;
+		                case 0x35: // Reset the MDB bus counters
+		                    ESP_LOGW(TAG, "CONFIG: MDB bus counters reset");
+		                    mdb_reset_counters();
+		                    publish_mdb_diag();
+		                    break;
+		                case 0x36: // Bring the SoftAP up for on-site debugging
+		                    /* Gives an engineer standing at the machine the
+		                     * full byte trace over /api/v1/mdb/trace without
+		                     * touching the vending machine's own network. On
+		                     * WiFi boards the STA link is unaffected: the
+		                     * interface is already in APSTA mode. */
+		                    ESP_LOGW(TAG, "CONFIG: SoftAP requested for on-site debugging");
+		                    network_start_softap();
 		                    break;
 		                default:
 		                    ESP_LOGW(TAG, "CONFIG: unknown encrypted cmd 0x%02X", cmd);
@@ -3185,6 +3468,17 @@ void app_main(void) {
             }
         }
 
+        /* Bus debug level survives reboots — field debugging involves a lot
+         * of them, and a level that resets on every restart is a level you
+         * can never actually use. Absent key = the Kconfig default. */
+        {
+            uint8_t nvs_dbg_level = 0;
+            if (nvs_get_u8(handle, "mdb_dbg", &nvs_dbg_level) == ESP_OK) {
+                mdb_debug_apply_level(nvs_dbg_level, false);
+                ESP_LOGI(TAG, "NVS: mdb_dbg = %u", nvs_dbg_level);
+            }
+        }
+
 		nvs_close(handle);
 	}
 
@@ -3337,6 +3631,12 @@ void app_main(void) {
 		 * legitimately take 5-10s. */
 		.network.timeout_ms = mqtt_network_timeout,
 		.network.reconnect_timeout_ms = mqtt_reconnect,
+		/* The MDB trace dump is the largest message this firmware sends
+		 * (~1.7 KB with the topic); the IDF default outbound buffer is 1 KB
+		 * and would silently drop it. Inbound stays at the default — the
+		 * largest thing we receive is a 19-byte config/credit payload. */
+		.buffer.size = 1024,
+		.buffer.out_size = 2048,
 	};
 
 	mqtt_publish_mutex = xSemaphoreCreateMutex();
@@ -3389,6 +3689,23 @@ void app_main(void) {
 
     //------------------------ MAIN TASKS ----------------------//
 	//----------------------------------------------------------//
+
+	/* Bus observability. Set up before the bus task starts so the very first
+	 * command the VMC sends is already accounted for — on a machine that
+	 * never addresses us, those first seconds are the whole diagnosis. The
+	 * companion address is the other cashless slot (0x10 <-> 0x60), which is
+	 * what the VMC would be polling if the machine is configured for the
+	 * other reader. */
+	mdb_debug_init(cashless_device_address, cashless_device_address == 16 ? 96 : 16);
+
+	{
+		const esp_timer_create_args_t mdb_defer_args = {
+			.callback = mdb_diag_defer_cb,
+			.name = "mdb_diag_defer"
+		};
+		ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_create(&mdb_defer_args, &mdb_diag_defer_timer));
+	}
+
 	mdbSessionQueue = xQueueCreate(1 /*queue-length*/, sizeof(uint16_t));
 	xTaskCreatePinnedToCore(vTaskMdbEvent, "TaskMdbEvent", 4096, NULL, 1, NULL, 1);
 

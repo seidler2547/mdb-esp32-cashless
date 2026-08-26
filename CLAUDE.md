@@ -42,6 +42,35 @@ quiet; others (SandenVendo SN02-B) stay in DISABLED forever until it is
 answered. The firmware answers up to `MDB_ID_MAX_ATTEMPTS` times per reset
 cycle and then stays silent, which satisfies both.
 
+**MDB bus diagnostics (`mdb_debug.c` / `mdb_debug.h`)**: passive
+instrumentation of the bit-banged link, fed from the four bus primitives in
+`mdb-slave-esp32s3.c` (`mdb_wait_start`, `mdb_sample_word`, `read_9`/
+`read_9_timeout`, `write_payload_9`) so every byte in both directions is
+accounted for. Keeps bus counters (framing/checksum/gap errors, ACK/NAK/RET,
+short blocks, response latency, silences), a per-address command map, and a
+rolling byte trace (`CONFIG_MDB_DEBUG_TRACE_DEPTH`, 256 entries ≈ 2 KiB),
+plus automatic trace snapshots frozen around bus errors. Derives a one-word
+verdict — `ok` / `wrong_addr` / `not_enabled` / `bus_silent` / `no_rx` — which
+answers the "is the VMC even talking to us, and at which address" question
+directly. Because RX is wired to the MDB *master transmit* line only, every
+received byte is known to come from the VMC, which makes the address map
+exact rather than heuristic.
+
+Surfaces: a nested `bus` object on the existing `mdb-log` MQTT heartbeat
+(merged additively into `embeddeds.mdb_diagnostics` by `mqtt-webhook` — no
+migration), the captive portal's **MDB bus** panel plus
+`GET /api/v1/mdb/diag`, `GET /api/v1/mdb/trace` and
+`POST /api/v1/mdb/debug`, and the serial console. Runtime control via config
+commands `0x33` (dump now), `0x34` (debug level, persisted), `0x35` (reset
+counters) and `0x36` (start SoftAP for on-site access). Full field guide:
+`docs/mdb-bus-debugging.md`. Host-testable without a board:
+`mdb-slave-esp32s3/test/run.sh`.
+
+Diagnostics never run inside the bit-sampling critical section, and the
+state-change publish is deferred to an esp_timer one-shot that fires only
+after the bus task has put its answer on the wire — an MQTT publish between
+a VMC command and the response can exceed the 5 ms MDB response deadline.
+
 **Security**: MQTT and BLE payloads use XOR obfuscation with an 18-byte `passkey` plus a ±8 second timestamp window to prevent replay attacks.
 
 **MQTT topics**: `/{company_id}/{device_id}/{event}` where events are: `sale`, `status`, `paxcounter`, `dex`, `mdb-log`, `credit`, `ota`, `config`
@@ -57,6 +86,7 @@ cycle and then stays silent, which satisfies both.
 - `mqtt_user` – MQTT username
 - `mqtt_pass` – MQTT password
 - `mdb_addr` – MDB peripheral address selector (1=0x10, 2=0x60), set via config cmd 0x31
+- `mdb_dbg` – MDB bus debug level 0-3 (see "MDB bus diagnostics"), set via config cmd 0x34 or the captive portal
 - `restart_reason` – set by `tracked_restart()` before reboot, erased on next boot after publish
 - `last_uptime` – uptime at the moment of `tracked_restart()`, paired with `restart_reason`
 - `apn` – cellular APN (P1+, set via captive portal `/api/v1/cellular/configure`)
@@ -104,13 +134,18 @@ flow) or starts the MQTT client. The pre-P2 inline `wifi_event_handler`
 plus three POST endpoints: `/api/v1/cellular/configure` `{apn, pin, lte_mode}`,
 `/api/v1/wifi/configure` `{ssid, password}` (rejected on cellular boards),
 and `/api/v1/claim` `{prov_code, srv_url}` (writes NVS + spawns
-`provision_claim_task` from `provision.h`).
+`provision_claim_task` from `provision.h`), plus the MDB debug trio
+`GET /api/v1/mdb/diag`, `GET /api/v1/mdb/trace` and
+`POST /api/v1/mdb/debug` `{level, reset}`.
 The captive portal HTML (`webui/index.html`, embedded via `EMBED_FILES`)
 is a vanilla-JS SPA: polls `/system/info` every 2 s, renders one of 7
 wizard-state views (booting, offline, cellular_config, cellular_registering,
 wifi_connecting, ready_to_claim, claimed), shows a status banner with
 signal bars + operator + IP, and disables submit buttons during in-flight
-or registering states. The old combined `/api/v1/settings/set` endpoint
+or registering states. Below the wizard sits a collapsible **MDB bus**
+panel (hidden unless `/api/v1/mdb/diag` answers, so it degrades cleanly on
+older firmware) rendering the bus verdict in plain language, the counters,
+the named address map, the debug-level selector and a trace viewer. The old combined `/api/v1/settings/set` endpoint
 was removed in P3.
 
 **Cellular recovery (P4 + post-milestone hardening)**: Multi-layer escalation. Layer 1 — `network.c::ppp_reconnect_task` retries `modem_disconnect`+`modem_connect` 3 times on `IP_EVENT_PPP_LOST_IP`, ~6 s total. Layer 1.5/1.6/2/3 — `cellular_bring_up_task` recovery ladder triggers on **either** IPCP timeout **or phantom-PPP** (TCP probe to 1.1.1.1:53 fails after PPP_GOT_IP). Steps: `modem_pdp_reset` (CGACT=0/1, ~5s) → `modem_rf_reset` (CFUN=0/1, ~10s) → `modem_soft_restart` (CFUN=1,1, ~12s) → `modem_hard_reset` (PMU DC3 cut + PWRKEY, ~15s, true reset). Each step is followed by `modem_connect` + reachability probe; only if probe succeeds is `UPLINK_UP` fired. Worst-case ~3-4 min ladder traversal before bailing OFFLINE; `offline_retry` timer (30s) re-spawns fresh `cellular_bring_up_task`. Layer 4 — `modem.c::modem_watchdog_task` (30 s tick) calls `modem_hard_reset` after 3 consecutive `AT` failures (bounded to 2 hard-resets before deferring to Layer 5). Layer 5 — `mqtt_watchdog_cb` hard-reboots after 10 min without MQTT. MQTT keepalive bumps to 180 s + network/reconnect timeouts to 30 s/20 s when uplink is cellular at `esp_mqtt_client_init` time. Known limitation: at MQTT-init time `network_init()` has not yet run, so `modem_present` is false and cellular boards still get the WiFi-tuned MQTT values on the first connection. The watchdog task is started exclusively from `cellular_bring_up_task` (after `modem_connect` succeeds), so WiFi-only boards never spawn it.
@@ -414,3 +449,6 @@ npx vitest run --watch  # watch mode
 ```
 
 Edge function tests (Deno): `Docker/supabase/functions/mqtt-webhook/mdb-log.test.ts`
+
+Firmware host tests (plain gcc, no ESP-IDF or board needed) for the MDB bus
+observability module: `mdb-slave-esp32s3/test/run.sh`
