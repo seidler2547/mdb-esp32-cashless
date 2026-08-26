@@ -11,6 +11,7 @@
 #include <driver/gpio.h>
 #include <driver/uart.h>
 #include <esp_wifi.h>
+#include <esp_cpu.h>
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -79,6 +80,14 @@
 // or the receive opto-coupler has failed. Used as the main loop's read
 // timeout so the firmware can say so instead of waiting forever.
 #define MDB_BUS_IDLE_US		250000
+
+// CPU cycles per microsecond, used by the start-bit wait to time out without
+// calling into the timer subsystem. Fixed because power management (DFS) is
+// not enabled in this project.
+#ifndef CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
+#define CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ 160
+#endif
+#define MDB_CPU_CYCLES_PER_US	CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
 
 // Bit masks for MDB operations
 #define BIT_MODE_SET 	0b100000000
@@ -422,11 +431,27 @@ static inline int mdb_wait_start(uint32_t timeout_us) {
 		return 0;
 	}
 
-	int64_t deadline = esp_timer_get_time() + timeout_us;
-	uint32_t spins = 0;
+	/* CCOUNT, deliberately, not esp_timer_get_time().
+	 *
+	 * This loop runs flat out on a task that never yields, so on an idle
+	 * bus it is the only thing this core does. esp_timer_get_time() costs
+	 * several APB accesses plus a value-valid poll; calling it hundreds of
+	 * thousands of times a second from here loads the whole system — and on
+	 * a bench setup with no VMC attached, it would do so permanently.
+	 * Reading the cycle counter is one register instruction on the local
+	 * core, cheap enough to check on every iteration, which also makes the
+	 * timeout more accurate than a spin-count heuristic.
+	 *
+	 * CCOUNT wraps every ~26 s at 160 MHz, far beyond the longest timeout
+	 * we are passed (250 ms), and the unsigned subtraction is correct
+	 * across a wrap. Power management is not enabled in this project so the
+	 * frequency is fixed; if DFS were ever turned on, the clock could only
+	 * drop, which stretches the timeout rather than shortening it. */
+	uint32_t start = esp_cpu_get_cycle_count();
+	uint32_t limit = timeout_us * MDB_CPU_CYCLES_PER_US;
 
 	while (gpio_get_level(PIN_MDB_RX)) {
-		if ((++spins & 0x1F) == 0 && esp_timer_get_time() >= deadline)
+		if (esp_cpu_get_cycle_count() - start >= limit)
 			return -1; // no data arrived
 	}
 	return 0;
