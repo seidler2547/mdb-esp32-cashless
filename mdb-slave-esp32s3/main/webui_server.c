@@ -478,8 +478,8 @@ static esp_err_t wifi_scan_get_handler(httpd_req_t *req) {
  * exactly this, and on cellular boards it is up permanently anyway.
  */
 
-#define MDB_HTTP_BUS_LEN     768
-#define MDB_HTTP_DIAG_LEN   1024
+#define MDB_HTTP_BUS_LEN     896
+#define MDB_HTTP_DIAG_LEN   1280
 #define MDB_HTTP_TRACE_LEN  4096
 
 /* GET /api/v1/mdb/diag — counters, address map and verdict as JSON. */

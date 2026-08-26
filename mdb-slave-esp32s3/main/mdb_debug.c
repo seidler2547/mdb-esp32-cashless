@@ -27,6 +27,10 @@
 
 /* VMC handshake bytes. All three arrive with the mode bit set, which is
  * how they are told apart from the peripheral data they acknowledge. */
+/* Command bits of an address byte (MDB/ICP 4.2 section 7). */
+#define MDB_CMD_RESET   0
+#define MDB_CMD_POLL    2
+
 #define WORD_ACK    0x100
 #define WORD_RET    0x1AA
 #define WORD_NAK    0x1FF
@@ -98,6 +102,12 @@ static struct {
 } s_c;
 
 static uint32_t s_addr_map[ADDR_SLOTS];
+
+/* Commands the VMC sends to *our* address, split by the command bits. The
+ * split is what separates "the VMC is talking to us" from "the VMC is
+ * talking to us and getting nowhere": a reader whose answers never arrive
+ * sees RESET over and over and a POLL count stuck at zero. */
+static uint32_t s_own_cmd[8];
 
 static int64_t s_t_last_rx   = 0;   /* last byte from the VMC          */
 static int64_t s_t_last_mine = 0;   /* last address byte that was ours */
@@ -303,6 +313,7 @@ void mdb_debug_reset(void)
 {
     memset(&s_c, 0, sizeof(s_c));
     memset(s_addr_map, 0, sizeof(s_addr_map));
+    memset(s_own_cmd, 0, sizeof(s_own_cmd));
     s_t_last_rx   = 0;
     s_t_last_mine = 0;
     s_in_silence  = false;
@@ -360,6 +371,7 @@ void mdb_debug_rx_byte(uint16_t word, bool stop_ok)
 
             if ((byte & ADDR_MASK) == s_own_addr) {
                 s_c.cmds_mine++;
+                s_own_cmd[byte & 0x07]++;
                 s_t_last_mine = now;
             } else {
                 s_c.cmds_other++;
@@ -458,7 +470,14 @@ const char *mdb_debug_verdict(void)
     int64_t quiet_ms = (esp_timer_get_time() - s_t_last_rx) / 1000;
     if (quiet_ms > 2000) return MDB_VERDICT_BUS_SILENT;
 
-    if (s_c.cmds_mine > 0) return MDB_VERDICT_OK;
+    if (s_c.cmds_mine > 0) {
+        /* The VMC keeps resetting us and never advances to POLL: it is not
+         * accepting our answers. Reporting this as "ok" because bytes are
+         * arriving would hide the actual fault. */
+        if (s_own_cmd[MDB_CMD_POLL] == 0 && s_own_cmd[MDB_CMD_RESET] >= 3)
+            return MDB_VERDICT_RESET_LOOP;
+        return MDB_VERDICT_OK;
+    }
     if (s_other_addr && s_addr_map[s_other_addr >> 3] > 0) return MDB_VERDICT_WRONG_ADDR;
 
     return MDB_VERDICT_NOT_ENABLED;
@@ -504,6 +523,13 @@ size_t mdb_debug_json(char *out, size_t cap)
         (unsigned long) s_c.max_silence_ms,
         (unsigned long) last_rx,         (unsigned long) last_mine,
         (unsigned long) s_c.rsp_last_us, (unsigned long) s_c.rsp_max_us);
+
+    n = appendf(out, cap, n,
+        ",\"myCmd\":{\"reset\":%lu,\"setup\":%lu,\"poll\":%lu,\"vend\":%lu"
+        ",\"reader\":%lu,\"exp\":%lu}",
+        (unsigned long) s_own_cmd[0], (unsigned long) s_own_cmd[1],
+        (unsigned long) s_own_cmd[2], (unsigned long) s_own_cmd[3],
+        (unsigned long) s_own_cmd[4], (unsigned long) s_own_cmd[7]);
 
     n = appendf(out, cap, n, ",\"addr\":{");
     bool first = true;

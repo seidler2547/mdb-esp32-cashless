@@ -235,6 +235,29 @@ int main(void)
     /* last byte pushed was 999 & 0xFF = 0xE7 and must be last in the render */
     CHECK(strcmp(trace + strlen(trace) - 2, "E7") == 0);
 
+    /* ---- 11. addressed, but the conversation never gets past RESET ---- */
+    printf("11. reset loop\n");
+    mdb_debug_init(0x10, 0x60);
+    for (int i = 0; i < 6; i++) {
+        vmc_block(0x10, NULL, 0);              /* RESET to us */
+        int64_t t = g_now + 200;
+        mdb_debug_tx_block(NULL, 0, 0x00, t);  /* our ACK*, which never lands */
+        g_now = t + BYTE_US;
+        ADV(10000000);                         /* VMC gives up, retries in 10 s */
+        vmc_block(0x0A, NULL, 0);              /* other peripherals keep going */
+    }
+    mdb_debug_json(json, sizeof(json));
+    printf("   %s\n", json);
+    CHECK(jstr_is(json, "verdict", MDB_VERDICT_RESET_LOOP));
+    CHECK(jget(json, "mine") == 6);
+    CHECK(strstr(json, "\"myCmd\":{\"reset\":6,\"setup\":0,\"poll\":0") != NULL);
+    CHECK(mdb_debug_addr_hint() == 0);          /* the address is right, so no hint */
+
+    /* once the VMC does poll us, the verdict clears */
+    vmc_block(0x12, NULL, 0);
+    mdb_debug_json(json, sizeof(json));
+    CHECK(jstr_is(json, "verdict", MDB_VERDICT_OK));
+
     printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

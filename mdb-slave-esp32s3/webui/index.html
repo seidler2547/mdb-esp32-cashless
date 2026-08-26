@@ -960,6 +960,12 @@
       case "ok":
         return { badge: "ok", cls: "",
                  text: "The vending machine is polling this reader at " + d.addr + "." };
+      case "reset_loop":
+        return { badge: "err", cls: "warn",
+                 text: "The machine addresses this reader but never gets past the reset " +
+                       "handshake \u2014 it keeps resetting and never polls, which means our " +
+                       "replies are not reaching it. Check the transmit side of the MDB " +
+                       "harness, and anything that could delay the answer past 5 ms." };
       case "wrong_addr":
         return { badge: "err", cls: "warn",
                  text: "The machine polls " + (bus.hint || "the other cashless address") +
@@ -1051,6 +1057,15 @@
            (d.polls && bus.lastMineMs != null ? "  (last " + bus.lastMineMs + " ms ago)" : ""),
            !d.polls);
     mdbRow(dl, "Last command", d.lastCmd);
+    if (bus.myCmd) {
+      /* The reset/poll split is what separates "the machine is talking to us"
+       * from "the machine is talking to us and getting nowhere". */
+      mdbRow(dl, "Commands to us",
+             "reset " + bus.myCmd.reset + ", setup " + bus.myCmd.setup +
+             ", poll " + bus.myCmd.poll + "\nvend " + bus.myCmd.vend +
+             ", reader " + bus.myCmd.reader + ", exp " + bus.myCmd.exp,
+             bus.myCmd.reset > 2 && bus.myCmd.poll === 0);
+    }
     mdbRow(dl, "Checksum errors", String(d.chkErr), d.chkErr > 0);
     mdbRow(dl, "Framing errors", String(bus.frmErr), bus.frmErr > 0);
     mdbRow(dl, "Lost bytes", String(bus.shortBlk) + " blocks, " + bus.gapErr + " gaps",

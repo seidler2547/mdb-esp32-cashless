@@ -58,6 +58,7 @@ typedef enum {
 
 /* Verdict strings returned by mdb_debug_verdict(). */
 #define MDB_VERDICT_OK          "ok"           /* VMC is addressing us          */
+#define MDB_VERDICT_RESET_LOOP  "reset_loop"   /* addressed, never polled       */
 #define MDB_VERDICT_WRONG_ADDR  "wrong_addr"   /* other cashless address polled */
 #define MDB_VERDICT_NOT_ENABLED "not_enabled"  /* bus busy, no cashless polled  */
 #define MDB_VERDICT_BUS_SILENT  "bus_silent"   /* traffic seen, then nothing    */

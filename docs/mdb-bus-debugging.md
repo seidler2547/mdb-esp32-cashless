@@ -29,6 +29,7 @@ consequences worth remembering when reading a trace:
 | Verdict | Meaning | What to do |
 |---|---|---|
 | `ok` | The VMC is addressing this reader. | The bus is fine; look at the counters for quality problems. |
+| `reset_loop` | The VMC addresses us but never gets past RESET — it never issues a POLL. | Our replies are not reaching the VMC. Check the transmit side of the harness, and anything that delays the answer past MDB's 5 ms deadline. |
 | `wrong_addr` | The VMC polls the *other* cashless address and never ours. | The machine is configured for the other cashless device. Switch this reader with config command `0x31` (or the `/machines/[id]` MDB address toggle). |
 | `not_enabled` | The bus is busy, but no cashless address is polled at all. | The card reader was never enabled in the vending machine's own setup menu. Nothing on our side will help. |
 | `bus_silent` | Traffic was seen, then stopped for over two seconds. | Machine powered down, harness came loose, or the receive opto-coupler failed. |
@@ -82,6 +83,7 @@ every 10 seconds.
 | `sil`, `maxSilMs` | Times the bus went quiet, and the longest such gap. |
 | `lastRxMs`, `lastMineMs` | Milliseconds since the last byte / the last command addressed to us. |
 | `rspUs`, `rspMaxUs` | Delay between the VMC's command and the first bit of our answer. MDB allows 5000 µs. |
+| `myCmd` | The commands addressed to *us*, split by type (`reset`, `setup`, `poll`, `vend`, `reader`, `exp`). A high `reset` with `poll` at zero is the `reset_loop` signature. |
 | `addr` | Per-address command counts, keyed by address byte (`"08"`, `"10"`, `"30"` …). |
 
 ## Reading a trace
@@ -143,10 +145,27 @@ reset.
 | Reader never shows up, machine otherwise fine | `verdict=wrong_addr`, `mine=0`, `addr` contains `60` | Machine configured for cashless #2; switch the address. |
 | Reader never shows up, bus clearly busy | `verdict=not_enabled`, no `10`/`60` in `addr` | Card reader not enabled in the VMC's setup menu. |
 | Nothing happens at all | `verdict=no_rx`, `rx=0` | Harness, machine power, or the RX opto-coupler. |
-| Machine keeps resetting the reader | `mine` climbing, `nak`/`ret` > 0, `rspMaxUs` near 5000 | Our answers are late or arrive corrupted. |
+| Machine keeps resetting the reader | `verdict=reset_loop`, `myCmd.reset` climbing, `myCmd.poll` = 0 | Our answers never reach the VMC. Transmit path, or an answer delayed past 5 ms — see the note on console logging below. |
+| Machine resets the reader intermittently | `mine` climbing, `nak`/`ret` > 0, `rspMaxUs` near 5000 | Our answers are late or arrive corrupted. |
 | We answer, the machine ignores us | `txBlk` > 0 but `ack` = 0 | Strongly suggests the transmit path is dead — the VMC never confirms a single block of ours. |
 | Intermittent failures, occasional vends | `frmErr`, `chkErr`, `gapErr`, `shortBlk` climbing | Electrical: grounding, cable length, interference. Pull a trace and look for `!` and large `/N` gaps mid-block. |
 | Worked, then stopped | `sil` > 0, `maxSilMs` large, `verdict=bus_silent` | The machine or the harness dropped out. The snapshot taken at that moment shows the last bytes before it went quiet. |
+
+## Why nothing logs from the bus task
+
+The console on this board is USB-Serial-JTAG, where a write blocks until the
+USB host drains the endpoint — milliseconds with a terminal attached, longer
+once the buffer backs up, and the project builds at `CONFIG_LOG_DEFAULT_LEVEL`
+DEBUG. A log line between a VMC command and our answer therefore pushes that
+answer past the 5 ms response deadline, and a log line anywhere else in the
+loop makes us miss the command that follows. The result is a VMC that resets
+the reader forever and never polls it — the `reset_loop` verdict above.
+
+So the bus task never touches the console: it formats into a ring slot and
+`mdb_log_task` does the writing, dropping lines rather than stalling the bus
+(it reports how many when it does). The same reasoning is why the diagnostics
+publish is deferred to an esp_timer one-shot that fires only after the answer
+is on the wire. Anything added to `vTaskMdbEvent` must follow the same rule.
 
 ## Testing the analysis code
 

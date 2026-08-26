@@ -50,7 +50,8 @@ accounted for. Keeps bus counters (framing/checksum/gap errors, ACK/NAK/RET,
 short blocks, response latency, silences), a per-address command map, and a
 rolling byte trace (`CONFIG_MDB_DEBUG_TRACE_DEPTH`, 256 entries ≈ 2 KiB),
 plus automatic trace snapshots frozen around bus errors. Derives a one-word
-verdict — `ok` / `wrong_addr` / `not_enabled` / `bus_silent` / `no_rx` — which
+verdict — `ok` / `reset_loop` / `wrong_addr` / `not_enabled` / `bus_silent` /
+`no_rx` — which
 answers the "is the VMC even talking to us, and at which address" question
 directly. Because RX is wired to the MDB *master transmit* line only, every
 received byte is known to come from the VMC, which makes the address map
@@ -70,6 +71,14 @@ Diagnostics never run inside the bit-sampling critical section, and the
 state-change publish is deferred to an esp_timer one-shot that fires only
 after the bus task has put its answer on the wire — an MQTT publish between
 a VMC command and the response can exceed the 5 ms MDB response deadline.
+
+**Nothing in `vTaskMdbEvent` may write to the console.** The console is
+USB-Serial-JTAG, so `ESP_LOG` blocks until the USB host drains the endpoint
+(milliseconds with a terminal attached, at DEBUG log level), which both
+delays the response past the 5 ms deadline and loses the next command —
+producing a VMC that resets the reader forever and never polls it. The bus
+task formats into a ring (`mdb_log_defer`) that `mdb_log_task` drains,
+dropping lines rather than stalling the bus.
 
 **Security**: MQTT and BLE payloads use XOR obfuscation with an 18-byte `passkey` plus a ±8 second timestamp window to prevent replay attacks.
 

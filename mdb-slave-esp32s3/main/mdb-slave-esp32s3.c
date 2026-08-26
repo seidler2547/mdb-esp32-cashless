@@ -19,6 +19,7 @@
 #include <math.h>
 #include <mqtt_client.h>
 #include <nvs_flash.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,6 +407,66 @@ static inline void mdb_resync(void) {
 	}
 }
 
+/* ---------- Deferred bus logging ----------
+ *
+ * ESP_LOG writes to the console synchronously. On this board the console is
+ * USB-Serial-JTAG (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG), where a write blocks
+ * until the USB host drains the endpoint — milliseconds with a terminal
+ * attached, longer once the buffer backs up, and this project builds at
+ * DEBUG log level so the buffer is rarely empty.
+ *
+ * A log line between a VMC command and our answer therefore pushes that
+ * answer past MDB's 5 ms response deadline, and a log line anywhere else in
+ * the loop makes us miss the command that follows. The symptom is a VMC that
+ * sends RESET, never gets a usable reply, and retries every ten seconds
+ * forever without ever issuing a POLL.
+ *
+ * So the bus task formats into a ring slot instead — bounded, tens of
+ * microseconds, no console I/O — and mdb_log_task does the writing. Dropping
+ * a line when the ring is full is always better than stalling the bus. */
+#define MDB_LOG_SLOTS     12
+#define MDB_LOG_SLOT_LEN  112
+
+static char     mdb_log_ring[MDB_LOG_SLOTS][MDB_LOG_SLOT_LEN];
+static uint8_t  mdb_log_levels[MDB_LOG_SLOTS];
+static volatile uint8_t  mdb_log_head = 0, mdb_log_tail = 0;
+static volatile uint32_t mdb_log_dropped = 0;
+
+__attribute__((format(printf, 2, 3)))
+static void mdb_log_defer(esp_log_level_t level, const char *fmt, ...) {
+
+	uint8_t next = (uint8_t) ((mdb_log_head + 1) % MDB_LOG_SLOTS);
+	if (next == mdb_log_tail) { mdb_log_dropped++; return; }   /* never block the bus */
+
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(mdb_log_ring[mdb_log_head], MDB_LOG_SLOT_LEN, fmt, ap);
+	va_end(ap);
+
+	mdb_log_levels[mdb_log_head] = (uint8_t) level;
+	mdb_log_head = next;
+}
+
+static void mdb_log_task(void *arg) {
+	for (;;) {
+		while (mdb_log_tail != mdb_log_head) {
+			uint8_t i = mdb_log_tail;
+			if (mdb_log_levels[i] <= ESP_LOG_WARN) ESP_LOGW(TAG, "%s", mdb_log_ring[i]);
+			else                                   ESP_LOGI(TAG, "%s", mdb_log_ring[i]);
+			mdb_log_tail = (uint8_t) ((i + 1) % MDB_LOG_SLOTS);
+		}
+
+		uint32_t dropped = mdb_log_dropped;
+		if (dropped) {
+			mdb_log_dropped = 0;
+			ESP_LOGW(TAG, "MDB LOG: dropped %lu line(s) — bus busier than the console",
+				(unsigned long) dropped);
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+}
+
 /* ---------- MDB bit-bang primitives ----------
  *
  * These four helpers are the only places where bytes cross the bus, which
@@ -661,17 +722,28 @@ void vTaskMdbEvent(void *pvParameters) {
 
 			mdb_debug_note_silence(MDB_BUS_IDLE_US);
 
-			if (now - bus_quiet_logged > 30 * 1000000LL) {
+			/* Report a genuinely quiet bus, at most twice a minute.
+			 *
+			 * The rate limit deliberately survives the traffic that breaks a
+			 * silence — it is keyed to wall clock, not to this quiet period.
+			 * Resetting it whenever a byte arrived meant a VMC retrying a
+			 * reset every ten seconds re-armed it on every gap, so the line
+			 * printed on each one and always read "silent for 0s" because
+			 * the quiet period was only ever 250 ms old. Two useless lines
+			 * would be a cosmetic bug; a console flood is not, because on a
+			 * USB-Serial-JTAG console it stalls the very bus timing this
+			 * code exists to measure. */
+			int64_t quiet_us = now - bus_quiet_since;
+			if (quiet_us > 2 * 1000000LL && now - bus_quiet_logged > 30 * 1000000LL) {
 				bus_quiet_logged = now;
-				ESP_LOGW(TAG, "MDB BUS: silent for %llus — verdict=%s, our addr=0x%02X, polls=%lu",
-					(unsigned long long) ((now - bus_quiet_since) / 1000000),
+				mdb_log_defer(ESP_LOG_WARN, "BUS: no traffic for %llus — verdict=%s, our addr=0x%02X, polls=%lu",
+					(unsigned long long) (quiet_us / 1000000),
 					mdb_debug_verdict(), cashless_device_address, mdb_poll_count);
 			}
 			continue;
 		}
 
-		bus_quiet_since  = 0;
-		bus_quiet_logged = 0;
+		bus_quiet_since = 0;   /* traffic resumed; the log rate limit persists */
 
 		uint16_t coming_read = (uint16_t) next_word;
 
@@ -687,12 +759,12 @@ void vTaskMdbEvent(void *pvParameters) {
 				// checksum bytes that happen to equal 0xAA on the shared bus.
 				ets_delay_us(200);
 				write_payload_9(last_tx_payload, last_tx_len);
-				ESP_LOGW(TAG, "MDB RET: retransmitted %d bytes", last_tx_len);
+				mdb_log_defer(ESP_LOG_WARN, "MDB RET: retransmitted %d bytes", last_tx_len);
 			} else if ((uint8_t) coming_read == NAK && last_tx_len > 0) {
 				// VMC received response with checksum error — retransmit.
 				ets_delay_us(200);
 				write_payload_9(last_tx_payload, last_tx_len);
-				ESP_LOGW(TAG, "MDB NAK: retransmitted %d bytes", last_tx_len);
+				mdb_log_defer(ESP_LOG_WARN, "MDB NAK: retransmitted %d bytes", last_tx_len);
 			} else {
 				// Any other byte with mode-bit set is an address byte for
 				// some device on the bus. This means the VMC has moved on
@@ -737,7 +809,7 @@ void vTaskMdbEvent(void *pvParameters) {
                     xEventGroupClearBits(xLedEventGroup, BIT_EVT_MDB);
                     xEventGroupSetBits(xLedEventGroup, BIT_EVT_TRIGGER);
 
-					ESP_LOGI( TAG, "RESET");
+					mdb_log_defer(ESP_LOG_INFO, "RESET");
 					break;
 				}
 				case SETUP: {
@@ -783,7 +855,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						// idf.py menuconfig -> "MDB Cashless Device"
 
-						ESP_LOGI( TAG, "CONFIG_DATA (vmcLevel=%u, ourLevel=1, cols=%u, rows=%u)", vmc_reported_level, vmcColumnsOnDisplay, vmcRowsOnDisplay);
+						mdb_log_defer(ESP_LOG_INFO, "CONFIG_DATA (vmcLevel=%u, ourLevel=1, cols=%u, rows=%u)", vmc_reported_level, vmcColumnsOnDisplay, vmcRowsOnDisplay);
 						break;
 					}
 					case MAX_MIN_PRICES: {
@@ -797,14 +869,14 @@ void vTaskMdbEvent(void *pvParameters) {
                         if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "SETUP:MAX_MIN_PRICES";
-						ESP_LOGI( TAG, "MAX_MIN_PRICES");
+						mdb_log_defer(ESP_LOG_INFO, "MAX_MIN_PRICES");
 						break;
 					}
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "SETUP:UNKNOWN";
 						mdb_debug_note_unknown_cmd();
-						ESP_LOGW(TAG, "SETUP: unhandled subcommand, drained bus");
+						mdb_log_defer(ESP_LOG_WARN, "SETUP: unhandled subcommand, drained bus");
 						break;
 					}
 					}
@@ -893,7 +965,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						time( &session_begin_time);
 
-						ESP_LOGI(TAG, "BEGIN_SESSION: funds=%u level=%u bytes=%d",
+						mdb_log_defer(ESP_LOG_INFO, "BEGIN_SESSION: funds=%u level=%u bytes=%d",
 							fundsAvailable, vmc_feature_level, available_tx);
 
 					} else if (session_cancel_todo) {
@@ -953,7 +1025,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						// Prevents machine from hanging in VEND_STATE (display stuck on credit,
 						// bill acceptor disabled) when BLE/MQTT approval never arrives.
 						if (machine_state == VEND_STATE && (now - vend_request_time) > 30) {
-							ESP_LOGW(TAG, "VEND TIMEOUT: no approval after 30s, denying");
+							mdb_log_defer(ESP_LOG_WARN, "VEND TIMEOUT: no approval after 30s, denying");
 							vend_denied_todo = true;
 						}
 
@@ -994,7 +1066,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
                         ble_notify_send((char*) &payload, sizeof(payload));
 
-						ESP_LOGI( TAG, "VEND_REQUEST");
+						mdb_log_defer(ESP_LOG_INFO, "VEND_REQUEST");
 						break;
 					}
 					case VEND_CANCEL: {
@@ -1017,7 +1089,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						// VEND_SUCCESS commands — without this check each one would
 						// publish a separate sale to MQTT.
 						if (machine_state != VEND_STATE) {
-						    ESP_LOGW(TAG, "VEND_SUCCESS received outside VEND_STATE (state=%d) — skipping sale publish", machine_state);
+						    mdb_log_defer(ESP_LOG_WARN, "VEND_SUCCESS received outside VEND_STATE (state=%d) — skipping sale publish", machine_state);
 						    // Still transition to IDLE in case the VMC expects it,
 						    // but do NOT publish a duplicate sale.
 						    machine_state = IDLE_STATE;
@@ -1028,7 +1100,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						// normal operation since VEND_REQUEST sets it, but protects
 						// against unexpected state).
 						if (itemPrice == 0) {
-						    ESP_LOGW(TAG, "VEND_SUCCESS ignored — itemPrice is 0");
+						    mdb_log_defer(ESP_LOG_WARN, "VEND_SUCCESS ignored — itemPrice is 0");
 						    machine_state = IDLE_STATE;
 						    break;
 						}
@@ -1057,10 +1129,10 @@ void vTaskMdbEvent(void *pvParameters) {
 							char topic_sale[128];
 							snprintf(topic_sale, sizeof(topic_sale), "/%s/%s/sale", my_company_id, my_device_id);
 							mqtt_publish_safe(mqttClient, topic_sale, (char*) &payload_mqtt, sizeof(payload_mqtt), 1, 0);
-							ESP_LOGW(TAG, "sale_queue fallback: direct publish (v1) for VEND_SUCCESS");
+							mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for VEND_SUCCESS");
 						}
 
-						ESP_LOGI( TAG, "VEND_SUCCESS price=%u item=%u", itemPrice, itemNumber);
+						mdb_log_defer(ESP_LOG_INFO, "VEND_SUCCESS price=%u item=%u", itemPrice, itemNumber);
 
 						// Clear vend data to prevent stale values if re-entered
 						itemPrice = 0;
@@ -1074,7 +1146,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						mdb_last_cmd = "VEND_FAILURE";
 
 						if (machine_state != VEND_STATE) {
-						    ESP_LOGW(TAG, "VEND_FAILURE ignored — not in VEND_STATE (state=%d)", machine_state);
+						    mdb_log_defer(ESP_LOG_WARN, "VEND_FAILURE ignored — not in VEND_STATE (state=%d)", machine_state);
 						    break;
 						}
 
@@ -1099,7 +1171,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
                         ble_notify_send((char*) &payload, sizeof(payload));
 
-						ESP_LOGI( TAG, "SESSION_COMPLETE");
+						mdb_log_defer(ESP_LOG_INFO, "SESSION_COMPLETE");
 						break;
 					}
 					case CASH_SALE: {
@@ -1118,17 +1190,17 @@ void vTaskMdbEvent(void *pvParameters) {
                             char topic[128];
                             snprintf(topic, sizeof(topic), "/%s/%s/sale", my_company_id, my_device_id);
                             mqtt_publish_safe(mqttClient, topic, (char*) &payload, sizeof(payload), 1, 0);
-                            ESP_LOGW(TAG, "sale_queue fallback: direct publish (v1) for CASH_SALE");
+                            mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for CASH_SALE");
                         }
 
-                        ESP_LOGI( TAG, "CASH_SALE");
+                        mdb_log_defer(ESP_LOG_INFO, "CASH_SALE");
 						break;
 					}
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "VEND:UNKNOWN";
 						mdb_debug_note_unknown_cmd();
-						ESP_LOGW(TAG, "VEND: unhandled subcommand, drained bus");
+						mdb_log_defer(ESP_LOG_WARN, "VEND: unhandled subcommand, drained bus");
 						break;
 					}
 					}
@@ -1165,14 +1237,14 @@ void vTaskMdbEvent(void *pvParameters) {
 						mdb_payload[ 0 ] = 0x08; // Canceled
 						available_tx = 1;
 
-						ESP_LOGI( TAG, "READER_CANCEL");
+						mdb_log_defer(ESP_LOG_INFO, "READER_CANCEL");
 						break;
 					}
 					default: {
 						mdb_drain_bus();
 						mdb_last_cmd = "READER:UNKNOWN";
 						mdb_debug_note_unknown_cmd();
-						ESP_LOGW(TAG, "READER: unhandled subcommand, drained bus");
+						mdb_log_defer(ESP_LOG_WARN, "READER: unhandled subcommand, drained bus");
 						break;
 					}
 					}
@@ -1192,7 +1264,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						if (read_9(NULL) != checksum) {
 							mdb_checksum_errors++; mdb_debug_note_chk_err();
-							ESP_LOGW(TAG, "EXPANSION:REQUEST_ID checksum FAIL");
+							mdb_log_defer(ESP_LOG_WARN, "EXPANSION:REQUEST_ID checksum FAIL");
 							mdb_drain_bus();
 							continue;
 						}
@@ -1217,13 +1289,13 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						if (read_9(NULL) != checksum) {
 							mdb_checksum_errors++; mdb_debug_note_chk_err();
-							ESP_LOGW(TAG, "EXPANSION:OPT_FEATURE checksum FAIL");
+							mdb_log_defer(ESP_LOG_WARN, "EXPANSION:OPT_FEATURE checksum FAIL");
 							mdb_drain_bus();
 							continue;
 						}
 
 						mdb_last_cmd = "EXPANSION:OPT_FEATURE";
-						ESP_LOGI(TAG, "OPTIONAL_FEATURE_ENABLED");
+						mdb_log_defer(ESP_LOG_INFO, "OPTIONAL_FEATURE_ENABLED");
 						// ACK with no data (available_tx stays 0)
 						break;
 					}
@@ -1233,7 +1305,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						mdb_drain_bus();
 						mdb_last_cmd = "EXPANSION:UNKNOWN";
 						mdb_debug_note_unknown_cmd();
-						ESP_LOGW(TAG, "EXPANSION: unhandled subcommand 0x%02X, drained bus", exp_sub);
+						mdb_log_defer(ESP_LOG_WARN, "EXPANSION: unhandled subcommand 0x%02X, drained bus", exp_sub);
 						break;
 					}
 					}
@@ -1275,7 +1347,7 @@ void vTaskMdbEvent(void *pvParameters) {
 						sniff_itemPrice = (read_9(&checksum_sniff) << 8) | read_9(&checksum_sniff);
 						sniff_itemNumber = (read_9(&checksum_sniff) << 8) | read_9(&checksum_sniff);
 						if (read_9(NULL) != checksum_sniff) continue;
-						ESP_LOGI(TAG, "SNIFF VEND_REQUEST price=%u item=%u", sniff_itemPrice, sniff_itemNumber);
+						mdb_log_defer(ESP_LOG_INFO, "SNIFF VEND_REQUEST price=%u item=%u", sniff_itemPrice, sniff_itemNumber);
 						break;
 					}
 					case VEND_SUCCESS: {
@@ -1287,11 +1359,11 @@ void vTaskMdbEvent(void *pvParameters) {
 						// The sniff path can miss VEND_REQUEST (checksum error, bus busy)
 						// which leaves sniff_itemPrice at 0 — don't publish bogus sales.
 						if (sniff_itemPrice == 0) {
-						    ESP_LOGW(TAG, "SNIFF VEND_SUCCESS ignored — no prior VEND_REQUEST (price=0)");
+						    mdb_log_defer(ESP_LOG_WARN, "SNIFF VEND_SUCCESS ignored — no prior VEND_REQUEST (price=0)");
 						    break;
 						}
 
-						ESP_LOGI(TAG, "SNIFF CARD_SALE price=%u item=%u", sniff_itemPrice, sniff_itemNumber);
+						mdb_log_defer(ESP_LOG_INFO, "SNIFF CARD_SALE price=%u item=%u", sniff_itemPrice, sniff_itemNumber);
 
 						/* Persistent queue handles publish + retry — see VEND_SUCCESS */
 						if (!sale_queue_enqueue(0x23, sniff_itemPrice, sniff_itemNumber)) {
@@ -1300,7 +1372,7 @@ void vTaskMdbEvent(void *pvParameters) {
 							char topic[128];
 							snprintf(topic, sizeof(topic), "/%s/%s/sale", my_company_id, my_device_id);
 							mqtt_publish_safe(mqttClient, topic, (char*) &payload, sizeof(payload), 1, 0);
-							ESP_LOGW(TAG, "sale_queue fallback: direct publish (v1) for SNIFF CARD_SALE");
+							mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for SNIFF CARD_SALE");
 						}
 
 						// Clear after enqueue to prevent stale data
@@ -2094,7 +2166,7 @@ void mdb_reset_counters(void) {
  * produced from the esp_timer task (shared with every other timer callback)
  * and from the MQTT event task, neither of which has a kilobyte to spare.
  * The MQTT client's outbound buffer is sized to match in app_main. */
-#define MDB_BUS_JSON_LEN     768
+#define MDB_BUS_JSON_LEN     896
 #define MDB_DIAG_MSG_LEN    1280
 #define MDB_TRACE_TEXT_LEN  1400
 #define MDB_TRACE_MQTT_MAX   220   /* trace entries offered to one MQTT dump */
@@ -3722,6 +3794,10 @@ void app_main(void) {
 	 * what the VMC would be polling if the machine is configured for the
 	 * other reader. */
 	mdb_debug_init(cashless_device_address, cashless_device_address == 16 ? 96 : 16);
+
+	/* Drains the deferred bus log. Started before the bus task so the very
+	 * first line it queues has somewhere to go. */
+	xTaskCreate(mdb_log_task, "mdb_log", 3072, NULL, 2, NULL);
 
 	{
 		const esp_timer_create_args_t mdb_defer_args = {
