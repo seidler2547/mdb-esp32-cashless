@@ -1019,6 +1019,12 @@
     if (bus.nak || bus.ret) p.push("answers the machine rejected");
     if (bus.rspMaxUs > 5000) p.push("answers past the 5 ms deadline");
     if (bus.sil) p.push("dropouts");
+    if (bus.rspMaxUs && bus.rspMaxUs < 5000 && bus.txAck > 4 && bus.myCmd &&
+        bus.myCmd.poll === 0) {
+      /* Answers go out well inside the deadline and the machine still will
+       * not talk to us: the fault is past the firmware, on the wire. */
+      p.push("answers sent on time but not acted on");
+    }
     return p;
   }
 

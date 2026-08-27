@@ -35,10 +35,20 @@
 #define WORD_RET    0x1AA
 #define WORD_NAK    0x1FF
 
-/* An inter-byte gap this long inside one command block means bytes went
- * missing or the VMC stalled mid-block. MDB/ICP 4.2 allows 1 ms between
- * bytes of a block, so 2 ms is comfortably outside spec. */
-#define GAP_ERR_US          2000
+/* One 11-bit MDB frame at 9600 baud (MDB/ICP 4.2 section 2.1).
+ *
+ * A byte's timestamp is taken when the byte finishes, so the difference
+ * between two consecutive timestamps is the second byte's own transmission
+ * time plus whatever idle sat between them. Subtracting a frame turns that
+ * period into the idle gap the spec actually bounds — without it, two bytes
+ * sent back to back look like a 1.15 ms gap and every well-behaved VMC on
+ * the bus appears to be sitting on the 1 ms inter-byte limit. */
+#define MDB_FRAME_US        1146
+
+/* An idle gap this long inside one command block means bytes went missing or
+ * the VMC stalled mid-block. MDB/ICP 4.2 section 3.2 puts t_inter-byte(max)
+ * at 1.0 ms; 1.5 ms leaves half a millisecond of slop for a sloppy VMC. */
+#define GAP_ERR_US          1500
 
 /* Post-trigger window: keep recording this many bytes after a bus error
  * before freezing the snapshot, so the dump shows the recovery too. */
@@ -136,6 +146,12 @@ static int64_t       s_snap_last_us = 0;
 
 /* ---------- helpers ---------- */
 
+/* Byte-to-byte period -> the idle time between them. */
+static inline uint32_t idle_gap_us(uint32_t period_us)
+{
+    return period_us > MDB_FRAME_US ? period_us - MDB_FRAME_US : 0;
+}
+
 /* Bounded append. Returns the new length, or the old one when the text
  * would not fit (leaving `out` NUL-terminated and unchanged). The format
  * attribute is what makes -Wformat check the long argument list in
@@ -214,7 +230,7 @@ static size_t render_entries(const trace_entry_t *buf, uint16_t n,
         char tok[16];
         size_t k = 0;
 
-        uint32_t gap = buf[i].t_us - prev_t;   /* wraps cleanly */
+        uint32_t gap = idle_gap_us(buf[i].t_us - prev_t);   /* wraps cleanly */
         prev_t = buf[i].t_us;
 
         if (i > 0 && gap >= 1000) {
@@ -350,8 +366,7 @@ void mdb_debug_rx_byte(uint16_t word, bool stop_ok)
     /* Inter-byte gap, evaluated only inside a command block: the gap
      * between two blocks legitimately covers our own response time. */
     if (s_t_last_rx && s_in_block) {
-        uint32_t gap = (uint32_t) (now - s_t_last_rx);
-        if (gap > GAP_ERR_US) s_c.gap_err++;
+        if (idle_gap_us((uint32_t) (now - s_t_last_rx)) > GAP_ERR_US) s_c.gap_err++;
     }
 
     if (word & 0x100) {

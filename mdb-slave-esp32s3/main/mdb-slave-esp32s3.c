@@ -76,11 +76,16 @@
 #define RET 	0xAA  // Retransmit previously sent data. Only VMC can send this
 #define NAK 	0xFF  // Negative acknowledgment
 
-// A VMC polls its peripherals continuously, so this much silence on the bus
-// already means nobody is talking: machine powered down, harness unplugged,
-// or the receive opto-coupler has failed. Used as the main loop's read
-// timeout so the firmware can say so instead of waiting forever.
-#define MDB_BUS_IDLE_US		250000
+// Silence long enough to mean nobody is talking at all: machine powered down,
+// harness unplugged, or the receive opto-coupler has failed. Used as the main
+// loop's read timeout so the firmware can say so instead of waiting forever.
+//
+// A whole second, because real VMCs idle for far longer than intuition
+// suggests: one measured in the field polls its changer every 226 ms and goes
+// quiet for up to 400 ms between scan cycles. The original 250 ms threshold
+// fired on that normal cadence, counting healthy idle as dropouts and burning
+// an error snapshot a minute on it.
+#define MDB_BUS_IDLE_US		1000000
 
 // CPU cycles per microsecond, used by the start-bit wait to time out without
 // calling into the timer subsystem. Fixed because power management (DFS) is

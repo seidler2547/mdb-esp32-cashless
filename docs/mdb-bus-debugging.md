@@ -78,9 +78,9 @@ every 10 seconds.
 | `txBlk`, `txAck` | Data blocks we sent / bare ACK\* answers ("nothing to report"). |
 | `frmErr` | Stop bit sampled low: baud mismatch, noise, or two devices talking at once. |
 | `chkErr` | Checksum mismatch on a frame addressed to us. |
-| `gapErr` | Inter-byte gap over 2 ms *inside* a command block (MDB allows 1 ms). |
+| `gapErr` | Idle gap over 1.5 ms *inside* a command block (MDB/ICP 4.2 §3.2 allows 1.0 ms). |
 | `unk`, `drain` | Commands we don't implement / bus resynchronisations. |
-| `sil`, `maxSilMs` | Times the bus went quiet, and the longest such gap. |
+| `sil`, `maxSilMs` | Times the bus went quiet for over a second, and the longest such gap. Real VMCs idle longer than you would guess — one measured in the field polls its changer every 226 ms and pauses up to 400 ms between scan cycles — so anything below a second is normal traffic, not a dropout. |
 | `lastRxMs`, `lastMineMs` | Milliseconds since the last byte / the last command addressed to us. |
 | `rspUs`, `rspMaxUs` | Delay between the VMC's command and the first bit of our answer. MDB allows 5000 µs. |
 | `myCmd` | The commands addressed to *us*, split by type (`reset`, `setup`, `poll`, `vend`, `reader`, `exp`). A high `reset` with `poll` at zero is the `reset_loop` signature. |
@@ -98,7 +98,7 @@ every 10 seconds.
 | `*XX` | Mode bit set: a VMC address byte, or `ACK 00` / `RET AA` / `NAK FF`. |
 | `>XX` | Transmitted by this device. |
 | `XX!` | Framing error — the stop bit sampled low. |
-| `/N` | A gap of N milliseconds before the next byte. |
+| `/N` | N milliseconds of **idle** before the next byte. Bytes sent back to back show no marker: the frame's own 1.15 ms transmission time is subtracted, so `/N` is comparable directly against the spec's 1.0 ms inter-byte limit. |
 
 So the line above reads: RESET to cashless #1 (`*10` + checksum), our ACK, a
 POLL, a four-byte answer from us, the VMC's ACK, then the changer being

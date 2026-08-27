@@ -20,7 +20,7 @@ void nvs_close(int h) { (void)h; }
 
 /* ---- helpers ---- */
 #define ADV(us) (g_now += (us))
-#define BYTE_US 1042          /* one 10-bit frame at 9600 baud */
+#define BYTE_US 1146          /* one 11-bit MDB frame at 9600 baud */
 
 static void rx(uint16_t w) { ADV(BYTE_US); mdb_debug_rx_byte(w, true); }
 static void rx_bad(uint16_t w) { ADV(BYTE_US); mdb_debug_rx_byte(w, false); }
@@ -91,6 +91,9 @@ int main(void)
     printf("   trace: %s\n", trace);
     CHECK(strstr(trace, ">*00") != NULL);   /* our ACK* is marked as ours */
     CHECK(strstr(trace, "*12") != NULL);    /* POLL to 0x10 */
+    /* Bytes sent back to back are one frame apart, which is not a gap: the
+     * renderer must not mark them, or every healthy block looks out of spec. */
+    CHECK(strstr(trace, "*12 12") != NULL);
 
     /* ---- 2. VMC configured for the other cashless address ---- */
     printf("2. wrong address\n");
@@ -164,7 +167,7 @@ int main(void)
     mdb_debug_trace_render(trace, sizeof(trace), 32);
     printf("   trace: %s\n", trace);
     CHECK(strstr(trace, "A5!") != NULL);        /* framing error is marked */
-    CHECK(strstr(trace, "/3 ") != NULL);        /* the 3 ms idle gap is marked */
+    CHECK(strstr(trace, "/2 ") != NULL);        /* the 2 ms idle gap is marked */
 
     /* ---- 7. handshake bytes and error snapshot ---- */
     printf("7. NAK/RET/ACK + checksum snapshot\n");
