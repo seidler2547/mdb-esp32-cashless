@@ -45,6 +45,26 @@ The same 470 Ω is correct on the receive side (it divides ~5 V from the VMC
 and only has to move 3.3 mA) and wrong on the transmit side (it divides 3.3 V
 and has to move 15 mA). The value looks carried over between the two loops.
 
+## Where R5 is on the board
+
+![R5 location](mdb-slave-esp32s3/R5-location.png)
+
+R5 is the **left-hand resistor of the row of three 0603s** running between the
+two TLP785 optocouplers (`U1` above, `U4` below), on the top side. Its
+silkscreen label is printed immediately to its left, stacked above `R2`'s. The
+other two in that row — `R2` (470 Ω) and `R10` (1 kΩ) — are correct and should
+not be touched.
+
+Board coordinates, if you are probing rather than eyeballing:
+
+| Ref | PCB position (mm) | Value | Change |
+|---|---|---|---|
+| `R5` | 197.509, 106.907 | 470 Ω | **→ 100 Ω** |
+| `R2` | 200.632, 106.907 | 470 Ω | none |
+| `R10` | 203.755, 106.907 | 1 kΩ | none |
+| `U1` | 200.590, 102.884 | TLP785 | rank → BL |
+| `U4` | 200.570, 110.930 | TLP785 | none |
+
 ## Fix
 
 - **`R5`: 470 Ω → 100 Ω** → I_F ≈ 17 mA. Within the TLP785's 50 mA limit;
