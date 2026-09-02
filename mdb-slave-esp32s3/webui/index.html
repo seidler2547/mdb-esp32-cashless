@@ -972,6 +972,12 @@
                        " and never " + d.addr + ". It is configured for the other cashless " +
                        "device — switch this reader to " +
                        (bus.hint === "0x60" ? "Cashless #2" : "Cashless #1") + "." };
+      case "polled_not_enabled":
+        return { badge: "warn", cls: "warn",
+                 text: "The machine polls this reader and we answer, but it has never sent " +
+                       "READER ENABLE \u2014 so the reader can hold no session and reports " +
+                       "neither card sales nor the machine's cash sales. The link is fine; " +
+                       "switch the card reader on in the vending machine's own setup menu." };
       case "not_enabled":
         return { badge: "err", cls: "warn",
                  text: "The bus is busy, but the machine never polls a cashless device at " +
@@ -1026,6 +1032,58 @@
       p.push("answers sent on time but not acted on");
     }
     return p;
+  }
+
+  function mdbAgo(ms) {
+    if (ms == null || ms < 0) return "never";
+    if (ms < 90000) return Math.round(ms / 1000) + " s ago";
+    if (ms < 5400000) return Math.round(ms / 60000) + " min ago";
+    return Math.round(ms / 3600000) + " h ago";
+  }
+
+  var MDB_VEND_KIND = { "0x21": "cash", "0x23": "card (sniffed)", "0x24": "cashless" };
+
+  /* The price exactly as the machine sent it, next to what we published for
+   * it. Prices that all come out the same value are the usual complaint, and
+   * only these two numbers say whether the machine is sending one price or we
+   * are mangling several. `raw` is in the units we advertised — a scale
+   * factor of 100 means the machine can only express whole euros, so every
+   * price it sends rounds to one. */
+  function mdbVendSummary(bus) {
+    var v = bus.lastVend;
+    var sf = bus.scale || {};
+    var units = "scale " + sf.sf + " / " + sf.dp + " dp";
+    if (!v) return "none yet  (" + units + ")";
+
+    var euro = (v.cents / 100).toFixed(2);
+    var line = (MDB_VEND_KIND[v.cmd] || v.cmd) + " \u00B7 slot " + v.item +
+               " \u00B7 " + euro + "  " + mdbAgo(v.ageMs) +
+               "\nmachine sent " + v.raw + " (" + units + ")" +
+               "\n" + v.n + " sale" + (v.n === 1 ? "" : "s") + ", machine prices " +
+               v.rawMin + "\u2013" + v.rawMax;
+    if (v.rawMin === v.rawMax && v.n > 2) {
+      line += "\nEvery sale carried the same price. The machine is sending one " +
+              "value \u2014 check its price programming, and that its scale factor " +
+              "is fine enough for the shelf prices.";
+    }
+    return line;
+  }
+
+  function mdbVendSuspect(bus) {
+    var v = bus.lastVend;
+    return !!(v && v.n > 2 && v.rawMin === v.rawMax);
+  }
+
+  /* The audit is the only sales path that does not need the reader enabled,
+   * so on a machine reporting nothing it is the other half of the answer. */
+  function mdbDexSummary(dex) {
+    if (!dex.polls) return "not polled yet";
+    if (dex.lastOkMs < 0) {
+      return dex.polls + " attempt" + (dex.polls === 1 ? "" : "s") + ", never answered" +
+             "\nThe machine's audit port is not wired up or not responding.";
+    }
+    return dex.ok + " of " + dex.polls + " polls answered" +
+           "\nlast " + dex.bytes + " bytes, " + mdbAgo(dex.lastOkMs);
   }
 
   function renderMdb(d) {
@@ -1084,6 +1142,11 @@
            bus.rspMaxUs > 5000);
     mdbRow(dl, "Silent periods", bus.sil + " (longest " + bus.maxSilMs + " ms)", bus.sil > 0);
     mdbRow(dl, "Addresses seen", mdbAddrSummary(bus.addr));
+    mdbRow(dl, "Last sale", mdbVendSummary(bus), mdbVendSuspect(bus));
+    /* Older firmware sends no dex object at all — leave the row out rather
+     * than showing an empty one in red, same as the panel hides itself when
+     * the endpoint is missing. */
+    if (d.dex) mdbRow(dl, "DEX audit", mdbDexSummary(d.dex), d.dex.lastOkMs < 0);
     mdbRow(dl, "Trace held", d.traceEntries + " bytes" + (d.snapshot ? " + error snapshot" : ""));
 
     var sel = el("mdb_level");

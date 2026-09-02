@@ -50,12 +50,25 @@ accounted for. Keeps bus counters (framing/checksum/gap errors, ACK/NAK/RET,
 short blocks, response latency, silences), a per-address command map, and a
 rolling byte trace (`CONFIG_MDB_DEBUG_TRACE_DEPTH`, 256 entries ≈ 2 KiB),
 plus automatic trace snapshots frozen around bus errors. Derives a one-word
-verdict — `ok` / `reset_loop` / `wrong_addr` / `not_enabled` / `bus_silent` /
-`no_rx` — which
-answers the "is the VMC even talking to us, and at which address" question
-directly. Because RX is wired to the MDB *master transmit* line only, every
+verdict — `ok` / `reset_loop` / `polled_not_enabled` / `wrong_addr` /
+`not_enabled` / `bus_silent` / `no_rx` — which answers the "is the VMC even
+talking to us, and at which address" question directly.
+`polled_not_enabled` is the case a healthy-looking link hides: the VMC polls
+us and we answer, but it never sent READER ENABLE, so no session can open and
+*neither* cashless vends *nor* the VMC's CASH SALE reports ever arrive. Because RX is wired to the MDB *master transmit* line only, every
 received byte is known to come from the VMC, which makes the address map
 exact rather than heuristic.
+
+`lastVend` records the most recent sale as it crossed the wire — the raw
+16-bit price the VMC sent, the cents we published for it, and the running
+min/max of the raw price — beside `scale`, the scale factor and decimal
+places we advertised in SETUP CONFIG_DATA. Together they separate the three
+ways a price can be wrong: the VMC really sends that number, we mangle it in
+conversion, or the advertised units are too coarse to express the shelf price
+(at scale factor 100 one unit *is* 1.00, so every price rounds to a whole
+euro). `dex` reports the hourly audit's health — the only sales path that
+does not depend on the reader being enabled, and previously invisible except
+on the serial console.
 
 Surfaces: a nested `bus` object on the existing `mdb-log` MQTT heartbeat
 (merged additively into `embeddeds.mdb_diagnostics` by `mqtt-webhook` — no
@@ -71,6 +84,22 @@ Diagnostics never run inside the bit-sampling critical section, and the
 state-change publish is deferred to an esp_timer one-shot that fires only
 after the bus task has put its answer on the wire — an MQTT publish between
 a VMC command and the response can exceed the 5 ms MDB response deadline.
+
+**Price conversion (`mdb_price.h`)**: MDB carries prices as a 16-bit count of
+scale-factor units, and the *reader* dictates the unit via the scale factor
+and decimal places it puts in its SETUP CONFIG_DATA answer. `mdb_price.h`
+converts between those units and the whole cents the sale payload carries,
+with exact integer arithmetic. The previous `TO_SCALE_FACTOR`/
+`FROM_SCALE_FACTOR` macros chained `pow(10, -dp)` and truncated into an
+integer; `pow(10, -2)` is the double just *above* 1/100, so dividing by it
+landed below the whole number and dropped a cent. At the shipping
+configuration (scale factor 1, two decimals — a conversion that is
+mathematically the identity) 16 of the first 401 prices came out a cent
+short, 0.29, 1.16–1.19 and 2.05 among them, with nothing in any log to show
+it. Conversions at two decimal places or fewer are now exact in both
+directions; three decimal places is inherently lossy because the sale payload
+carries whole cents. Host tests cover every scale factor / decimal place pair
+menuconfig can produce: `mdb-slave-esp32s3/test/run.sh`.
 
 **Nothing in `vTaskMdbEvent` may write to the console.** The console is
 USB-Serial-JTAG, so `ESP_LOG` blocks until the USB host drains the endpoint

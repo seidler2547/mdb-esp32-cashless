@@ -59,6 +59,7 @@ typedef enum {
 /* Verdict strings returned by mdb_debug_verdict(). */
 #define MDB_VERDICT_OK          "ok"           /* VMC is addressing us          */
 #define MDB_VERDICT_RESET_LOOP  "reset_loop"   /* addressed, never polled       */
+#define MDB_VERDICT_NOT_READY   "polled_not_enabled" /* polled, never enabled   */
 #define MDB_VERDICT_WRONG_ADDR  "wrong_addr"   /* other cashless address polled */
 #define MDB_VERDICT_NOT_ENABLED "not_enabled"  /* bus busy, no cashless polled  */
 #define MDB_VERDICT_BUS_SILENT  "bus_silent"   /* traffic seen, then nothing    */
@@ -101,6 +102,25 @@ void mdb_debug_note_chk_err(void);      /* checksum mismatch on a frame for us *
 void mdb_debug_note_unknown_cmd(void);  /* command we don't implement          */
 void mdb_debug_note_drain(void);        /* mdb_drain_bus() resynchronisation   */
 
+/* READER ENABLE accepted. Until this has happened at least once the VMC is
+ * polling a reader it has not switched on, which is a different fault from
+ * "the VMC is not talking to us" and needs a different fix - see
+ * MDB_VERDICT_NOT_READY. */
+void mdb_debug_note_reader_enabled(void);
+
+/* A sale as it crossed the bus, recorded where the firmware hands it to the
+ * sale queue.
+ *
+ * `raw` is the 16-bit price exactly as the VMC sent it, in the scale-factor
+ * units *we* advertised in SETUP CONFIG_DATA; `cents` is what we publish
+ * after conversion. Keeping both, plus the running min/max of `raw`, is what
+ * separates the three ways a price can come out wrong: the VMC really is
+ * sending that number (raw varies and matches the shelf price), we mangle it
+ * in conversion (raw is right, cents is not), or the units are too coarse to
+ * express the shelf price at all (raw is a small constant). None of that is
+ * recoverable after the fact from the sales table alone. */
+void mdb_debug_note_vend(uint8_t cmd, uint16_t raw, uint16_t item, uint32_t cents);
+
 /* ---------- reporting (any task) ---------- */
 
 /* Micro-verdict for the current bus situation - see MDB_VERDICT_*. */
@@ -112,7 +132,10 @@ uint8_t mdb_debug_addr_hint(void);
 
 /* Renders the counter block as a self-contained JSON object (including the
  * braces) into `out`. Returns the number of characters written, 0 on
- * failure. Sized for ~420 bytes; give it 512 to be safe. */
+ * failure. Typically ~700 bytes; the worst case — every address slot
+ * populated with saturated counters, plus `scale` and `lastVend` — is 1309,
+ * so give it 1408. Rendering is bounded and stops rather than truncating
+ * mid-token, but a clipped object is still invalid JSON downstream. */
 size_t mdb_debug_json(char *out, size_t cap);
 
 /* Renders up to `max_entries` of the most recent trace bytes, oldest
@@ -150,6 +173,12 @@ const char *mdb_last_command(void);
 uint32_t    mdb_poll_total(void);
 uint32_t    mdb_checksum_error_total(void);
 uint8_t     mdb_vmc_level(void);
+
+/* DEX audit health, for the same two surfaces. `try_ms`/`ok_ms` come back
+ * negative when the thing has never happened — which on a machine whose
+ * audit port was never wired up is the whole answer. */
+void        mdb_dex_stats(uint32_t *polls, uint32_t *ok, uint32_t *bytes,
+                          long *try_ms, long *ok_ms);
 
 /* Clears the bus counters and the protocol tallies together, so a "reset
  * counters" action leaves no half-old numbers behind. */

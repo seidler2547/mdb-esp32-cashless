@@ -17,6 +17,7 @@
 #include <sdkconfig.h>
 
 #include "mdb_debug.h"
+#include "mdb_price.h"   /* CONFIG_MDB_SCALE_FACTOR / _DECIMAL_PLACES fallbacks */
 
 #define TAG "mdb_dbg"
 
@@ -118,6 +119,21 @@ static uint32_t s_addr_map[ADDR_SLOTS];
  * talking to us and getting nowhere": a reader whose answers never arrive
  * sees RESET over and over and a POLL count stuck at zero. */
 static uint32_t s_own_cmd[8];
+
+/* Reader-enable and last-sale bookkeeping. Neither is on the bit-bang hot
+ * path: both are written once per command block at most. */
+static bool s_reader_enabled;
+
+static struct {
+    uint32_t n;         /* sales recorded since the last counter reset */
+    uint8_t  cmd;       /* 0x21 cash / 0x23 sniffed card / 0x24 cashless */
+    uint16_t raw;       /* price as the VMC sent it, in advertised units */
+    uint16_t item;
+    uint32_t cents;     /* what we published for it                      */
+    uint16_t raw_min;
+    uint16_t raw_max;
+    int64_t  t_us;
+} s_vend;
 
 static int64_t s_t_last_rx   = 0;   /* last byte from the VMC          */
 static int64_t s_t_last_mine = 0;   /* last address byte that was ours */
@@ -264,6 +280,9 @@ void mdb_debug_init(uint8_t own_addr, uint8_t other_addr)
 {
     s_own_addr   = own_addr & ADDR_MASK;
     s_other_addr = other_addr & ADDR_MASK;
+    /* A fresh boot genuinely has not been enabled by anyone yet — unlike
+     * mdb_debug_reset(), which only zeroes counters and must not forget it. */
+    s_reader_enabled = false;
     mdb_debug_reset();
     ESP_LOGI(TAG, "MDB debug ready: own=0x%02X other=0x%02X level=%u traceDepth=%d",
              s_own_addr, s_other_addr, s_level, TRACE_DEPTH);
@@ -330,6 +349,10 @@ void mdb_debug_reset(void)
     memset(&s_c, 0, sizeof(s_c));
     memset(s_addr_map, 0, sizeof(s_addr_map));
     memset(s_own_cmd, 0, sizeof(s_own_cmd));
+    memset(&s_vend, 0, sizeof(s_vend));
+    /* s_reader_enabled deliberately survives: it records something the VMC
+     * did, not a counter, and clearing it would make a mid-session reset of
+     * the counters report a reader that is plainly working as never enabled. */
     s_t_last_rx   = 0;
     s_t_last_mine = 0;
     s_in_silence  = false;
@@ -475,6 +498,20 @@ void mdb_debug_note_chk_err(void)
 
 void mdb_debug_note_unknown_cmd(void) { s_c.unknown_cmd++; }
 void mdb_debug_note_drain(void)       { s_c.drains++; }
+void mdb_debug_note_reader_enabled(void) { s_reader_enabled = true; }
+
+void mdb_debug_note_vend(uint8_t cmd, uint16_t raw, uint16_t item, uint32_t cents)
+{
+    if (s_vend.n == 0 || raw < s_vend.raw_min) s_vend.raw_min = raw;
+    if (s_vend.n == 0 || raw > s_vend.raw_max) s_vend.raw_max = raw;
+
+    s_vend.n++;
+    s_vend.cmd   = cmd;
+    s_vend.raw   = raw;
+    s_vend.item  = item;
+    s_vend.cents = cents;
+    s_vend.t_us  = esp_timer_get_time();
+}
 
 /* ---------- reporting ---------- */
 
@@ -491,6 +528,15 @@ const char *mdb_debug_verdict(void)
          * arriving would hide the actual fault. */
         if (s_own_cmd[MDB_CMD_POLL] == 0 && s_own_cmd[MDB_CMD_RESET] >= 3)
             return MDB_VERDICT_RESET_LOOP;
+
+        /* Polled, answering, never switched on. The link is healthy and the
+         * old verdict said so - but a reader the VMC has not enabled can
+         * hold no session, so it reports neither cashless vends nor the
+         * VMC's cash sales, and "ok" sent the operator looking at the wiring
+         * instead of at the machine's own service menu. */
+        if (!s_reader_enabled)
+            return MDB_VERDICT_NOT_READY;
+
         return MDB_VERDICT_OK;
     }
     if (s_other_addr && s_addr_map[s_other_addr >> 3] > 0) return MDB_VERDICT_WRONG_ADDR;
@@ -545,6 +591,23 @@ size_t mdb_debug_json(char *out, size_t cap)
         (unsigned long) s_own_cmd[0], (unsigned long) s_own_cmd[1],
         (unsigned long) s_own_cmd[2], (unsigned long) s_own_cmd[3],
         (unsigned long) s_own_cmd[4], (unsigned long) s_own_cmd[7]);
+
+    /* The units every `raw` on this bus is expressed in. Constant, but it is
+     * the key to reading the numbers above it and is not otherwise knowable
+     * from a report - a device flashed with a coarser scale factor looks
+     * identical until you see this. */
+    n = appendf(out, cap, n, ",\"scale\":{\"sf\":%u,\"dp\":%u}",
+                (unsigned) CONFIG_MDB_SCALE_FACTOR,
+                (unsigned) CONFIG_MDB_DECIMAL_PLACES);
+
+    if (s_vend.n) {
+        n = appendf(out, cap, n,
+            ",\"lastVend\":{\"cmd\":\"0x%02X\",\"raw\":%u,\"cents\":%lu,\"item\":%u"
+            ",\"n\":%lu,\"rawMin\":%u,\"rawMax\":%u,\"ageMs\":%lu}",
+            s_vend.cmd, s_vend.raw, (unsigned long) s_vend.cents, s_vend.item,
+            (unsigned long) s_vend.n, s_vend.raw_min, s_vend.raw_max,
+            (unsigned long) ((now - s_vend.t_us) / 1000));
+    }
 
     n = appendf(out, cap, n, ",\"addr\":{");
     bool first = true;

@@ -64,6 +64,8 @@ int main(void)
     mdb_debug_init(0x10, 0x60);
     mdb_debug_apply_level(MDB_DBG_SNAPSHOT, false);
 
+    mdb_debug_note_reader_enabled();                    /* VMC sent READER ENABLE */
+
     for (int i = 0; i < 10; i++) {
         vmc_block(0x12, NULL, 0);                       /* POLL to 0x10 */
         int64_t t = g_now + 200;
@@ -256,7 +258,68 @@ int main(void)
     CHECK(strstr(json, "\"myCmd\":{\"reset\":6,\"setup\":0,\"poll\":0") != NULL);
     CHECK(mdb_debug_addr_hint() == 0);          /* the address is right, so no hint */
 
-    /* once the VMC does poll us, the verdict clears */
+    /* Once the VMC does poll us the reset loop is over — but a reader that
+     * has never been enabled still cannot report a sale, so the verdict
+     * moves to polled_not_enabled rather than straight to ok. */
+    vmc_block(0x12, NULL, 0);
+    mdb_debug_json(json, sizeof(json));
+    CHECK(jstr_is(json, "verdict", MDB_VERDICT_NOT_READY));
+
+    mdb_debug_note_reader_enabled();
+    mdb_debug_json(json, sizeof(json));
+    CHECK(jstr_is(json, "verdict", MDB_VERDICT_OK));
+
+    /* ---- 12. the reader is polled but never switched on ---- */
+    printf("12. polled but not enabled\n");
+    mdb_debug_init(0x10, 0x60);
+    for (int i = 0; i < 8; i++) vmc_block(0x12, NULL, 0);   /* POLL to 0x10 */
+    mdb_debug_json(json, sizeof(json));
+    printf("   %s\n", json);
+    /* The old verdict for this was "ok": bytes arrive, our address is right,
+     * nothing on the link is wrong. What is wrong is in the machine's own
+     * service menu, and the operator has to be told to look there. */
+    CHECK(jstr_is(json, "verdict", MDB_VERDICT_NOT_READY));
+    CHECK(jget(json, "mine") == 8);
+    CHECK(mdb_debug_addr_hint() == 0);          /* the address is not the problem */
+    CHECK(strstr(json, "\"lastVend\"") == NULL);  /* nothing has been sold */
+
+    /* ---- 13. what a sale looked like on the wire ---- */
+    printf("13. last vend\n");
+    mdb_debug_init(0x10, 0x60);
+    mdb_debug_note_reader_enabled();
+    vmc_block(0x12, NULL, 0);
+
+    /* Three vends at three different prices, in the units we advertised. */
+    mdb_debug_note_vend(0x24, 150, 12, 150);
+    ADV(1000);
+    mdb_debug_note_vend(0x24,  90,  4,  90);
+    ADV(1000);
+    mdb_debug_note_vend(0x21, 205, 31, 205);   /* VMC-reported cash sale */
+    mdb_debug_json(json, sizeof(json));
+    printf("   %s\n", json);
+    CHECK(strstr(json, "\"lastVend\":{\"cmd\":\"0x21\",\"raw\":205,\"cents\":205,\"item\":31") != NULL);
+    CHECK(jget(json, "n") == 3);
+    CHECK(jget(json, "rawMin") == 90);
+    CHECK(jget(json, "rawMax") == 205);
+    /* The units are what make `raw` readable, so they ride along. */
+    CHECK(strstr(json, "\"scale\":{\"sf\":1,\"dp\":2}") != NULL);
+
+    /* A machine whose prices are all reported as the same number is the
+     * "every sale is 1 EUR" signature: min == max over many vends says the
+     * VMC really is sending one price, rather than us mangling several. */
+    mdb_debug_init(0x10, 0x60);
+    for (int i = 0; i < 20; i++) mdb_debug_note_vend(0x24, 100, (uint16_t) i, 100);
+    mdb_debug_json(json, sizeof(json));
+    CHECK(jget(json, "rawMin") == 100);
+    CHECK(jget(json, "rawMax") == 100);
+    CHECK(jget(json, "n") == 20);
+
+    /* Resetting the counters clears the sale history but not the fact that
+     * the VMC once enabled the reader. */
+    mdb_debug_note_reader_enabled();
+    mdb_debug_reset();
+    mdb_debug_json(json, sizeof(json));
+    CHECK(strstr(json, "\"lastVend\"") == NULL);
     vmc_block(0x12, NULL, 0);
     mdb_debug_json(json, sizeof(json));
     CHECK(jstr_is(json, "verdict", MDB_VERDICT_OK));

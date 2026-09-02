@@ -37,6 +37,7 @@
 #include "nimble.h"
 #include "webui_server.h"
 #include "sale_queue.h"
+#include "mdb_price.h"
 #include "network.h"
 #include "mdb_debug.h"
 
@@ -68,9 +69,7 @@
 #define ADC_UNIT_THERMISTOR     ADC_UNIT_1
 #define ADC_CHANNEL_THERMISTOR  ADC_CHANNEL_6   // Define the ADC unit, channel, and attenuation (NTC Thermistor)
 
-// Functions for scale factor conversion
-#define TO_SCALE_FACTOR(p, scale_to, dec_to) (p / scale_to / pow(10, -(dec_to) ))               // Converts to scale factor
-#define FROM_SCALE_FACTOR(p, scale_from, dec_from) (p * scale_from * pow(10, -(dec_from) ))     // Converts from scale factor
+// Scale-factor conversion lives in mdb_price.h (exact integer arithmetic).
 
 #define ACK 	0x00  // Acknowledgment / Checksum correct
 #define RET 	0xAA  // Retransmit previously sent data. Only VMC can send this
@@ -357,6 +356,24 @@ static const char *machine_state_name(machine_state_t s) {
 }
 
 RingbufHandle_t dexRingbuf;
+
+/* DEX audit health.
+ *
+ * The hourly audit is the only sales path that does not depend on the VMC
+ * having enabled the cashless reader, which makes it the fallback whenever
+ * the MDB side reports nothing - and until now its health existed solely as
+ * two console lines an hour, invisible to anyone not sitting at the serial
+ * port. `polls` counts attempts, `ok` the ones that produced bytes to
+ * publish, and the two timestamps say how long ago each last happened, so
+ * "the audit harness was never connected" is distinguishable from "the
+ * audit works and the machine really has sold nothing" from a heartbeat. */
+static struct {
+    uint32_t polls;
+    uint32_t ok;
+    uint32_t bytes;      /* size of the most recent snapshot */
+    int64_t  t_try_us;
+    int64_t  t_ok_us;
+} dex_stats;
 
 // MQTT client handle
 esp_mqtt_client_handle_t mqttClient = NULL;
@@ -1112,6 +1129,9 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						machine_state = IDLE_STATE;
 
+						mdb_debug_note_vend(0x24, itemPrice, itemNumber,
+						                    mdb_price_to_cents(itemPrice));
+
 						/* PIPE_BLE — immediate notify to companion app */
 						uint8_t payload_ble[19];
 						xorEncodeWithPasskey(0x0b, itemPrice, itemNumber, 0, (uint8_t*) &payload_ble);
@@ -1188,6 +1208,9 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						mdb_last_cmd = "CASH_SALE";
 
+                        mdb_debug_note_vend(0x21, itemPrice, itemNumber,
+                                            mdb_price_to_cents(itemPrice));
+
                         /* Persistent queue handles publish + retry — see VEND_SUCCESS */
                         if (!sale_queue_enqueue(0x21, itemPrice, itemNumber)) {
                             uint8_t payload[19];
@@ -1230,6 +1253,7 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						machine_state = ENABLED_STATE;
 						mdb_last_cmd = "READER_ENABLE";
+						mdb_debug_note_reader_enabled();
 
                         xEventGroupSetBits(xLedEventGroup, BIT_EVT_MDB | BIT_EVT_TRIGGER);
 
@@ -1370,6 +1394,9 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						mdb_log_defer(ESP_LOG_INFO, "SNIFF CARD_SALE price=%u item=%u", sniff_itemPrice, sniff_itemNumber);
 
+						mdb_debug_note_vend(0x23, sniff_itemPrice, sniff_itemNumber,
+						                    mdb_price_to_cents(sniff_itemPrice));
+
 						/* Persistent queue handles publish + retry — see VEND_SUCCESS */
 						if (!sale_queue_enqueue(0x23, sniff_itemPrice, sniff_itemNumber)) {
 							uint8_t payload[19];
@@ -1479,7 +1506,7 @@ uint8_t xorDecodeWithPasskey(uint16_t *itemPrice, uint16_t *itemNumber, uint8_t 
                             ((uint32_t) payload[5] << 0);
 
     if(itemPrice)
-        *itemPrice = TO_SCALE_FACTOR( FROM_SCALE_FACTOR(itemPrice32, 1, 2), CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES);
+        *itemPrice = mdb_price_from_cents((uint32_t) itemPrice32);
 
     if(itemNumber)
         *itemNumber = ((uint16_t) payload[6] << 8) | ((uint16_t) payload[7] << 0);
@@ -1490,7 +1517,7 @@ uint8_t xorDecodeWithPasskey(uint16_t *itemPrice, uint16_t *itemNumber, uint8_t 
 // Encode payload to communication between BLE and MQTT
 void xorEncodeWithPasskey(uint8_t cmd, uint16_t itemPrice, uint16_t itemNumber, uint16_t paxCounter, uint8_t *payload) {
 
-    uint32_t itemPrice32 = TO_SCALE_FACTOR( FROM_SCALE_FACTOR(itemPrice, CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES), 1, 2);
+    uint32_t itemPrice32 = mdb_price_to_cents(itemPrice);
 
 	esp_fill_random(payload + 1, sizeof(my_passkey));
 
@@ -1937,6 +1964,9 @@ void readTelemetryDDCMP() {
 // esp_timer task's default ~3.5 KB.
 static void telemetry_task(void *arg) {
 
+	dex_stats.polls++;
+	dex_stats.t_try_us = esp_timer_get_time();
+
 	readTelemetryDDCMP();
 	readTelemetryDEX();
 
@@ -1944,6 +1974,10 @@ static void telemetry_task(void *arg) {
 	uint8_t *dex = (uint8_t*) xRingbufferReceive(dexRingbuf, &dex_size, 0);
 
 	if (dex != NULL) {
+		dex_stats.ok++;
+		dex_stats.bytes   = (uint32_t) dex_size;
+		dex_stats.t_ok_us = esp_timer_get_time();
+
 		char topic[128];
 		snprintf(topic, sizeof(topic), "/%s/%s/dex", my_company_id, my_device_id);
 
@@ -2159,6 +2193,20 @@ uint32_t    mdb_poll_total(void)           { return mdb_poll_count; }
 uint32_t    mdb_checksum_error_total(void) { return mdb_checksum_errors; }
 uint8_t     mdb_vmc_level(void)            { return vmc_feature_level; }
 
+/* Ages rather than absolute times: the device's clock may not be synced, and
+ * "last succeeded 3 h ago" is the question being asked anyway. A negative age
+ * means it has never happened, which on a machine whose audit port was never
+ * wired up is the whole answer. */
+void mdb_dex_stats(uint32_t *polls, uint32_t *ok, uint32_t *bytes,
+                   long *try_ms, long *ok_ms) {
+    int64_t now = esp_timer_get_time();
+    if (polls) *polls = dex_stats.polls;
+    if (ok)    *ok    = dex_stats.ok;
+    if (bytes) *bytes = dex_stats.bytes;
+    if (try_ms) *try_ms = dex_stats.t_try_us ? (long) ((now - dex_stats.t_try_us) / 1000) : -1;
+    if (ok_ms)  *ok_ms  = dex_stats.t_ok_us  ? (long) ((now - dex_stats.t_ok_us)  / 1000) : -1;
+}
+
 void mdb_reset_counters(void) {
     mdb_debug_reset();
     mdb_poll_count = 0;
@@ -2171,8 +2219,12 @@ void mdb_reset_counters(void) {
  * produced from the esp_timer task (shared with every other timer callback)
  * and from the MQTT event task, neither of which has a kilobyte to spare.
  * The MQTT client's outbound buffer is sized to match in app_main. */
-#define MDB_BUS_JSON_LEN     896
-#define MDB_DIAG_MSG_LEN    1280
+/* Worst case: every address slot populated with saturated counters, plus
+ * scale and lastVend — 1309 bytes. Rendering is bounded and stops rather
+ * than truncating mid-token, but a clipped object is invalid JSON at the
+ * webhook, so leave headroom instead of relying on the guard. */
+#define MDB_BUS_JSON_LEN    1408
+#define MDB_DIAG_MSG_LEN    2048
 #define MDB_TRACE_TEXT_LEN  1400
 #define MDB_TRACE_MQTT_MAX   220   /* trace entries offered to one MQTT dump */
 
@@ -2200,9 +2252,15 @@ static void publish_mdb_diag(void) {
 
     if (mdb_debug_json(bus, MDB_BUS_JSON_LEN) == 0) strcpy(bus, "{}");
 
+    uint32_t dex_polls, dex_ok, dex_bytes;
+    long dex_try_ms, dex_ok_ms;
+    mdb_dex_stats(&dex_polls, &dex_ok, &dex_bytes, &dex_try_ms, &dex_ok_ms);
+
     int n = snprintf(msg, MDB_DIAG_MSG_LEN,
         "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,\"lastCmd\":\"%s\",\"vmcLevel\":%u,"
-        "\"saleQueue\":{\"pending\":%lu,\"overflow\":%lu,\"lastSeq\":%lu,\"fastPath\":%lu},\"bus\":%s}",
+        "\"saleQueue\":{\"pending\":%lu,\"overflow\":%lu,\"lastSeq\":%lu,\"fastPath\":%lu},"
+        "\"dex\":{\"polls\":%lu,\"ok\":%lu,\"bytes\":%lu,\"lastTryMs\":%ld,\"lastOkMs\":%ld},"
+        "\"bus\":%s}",
         machine_state_name(machine_state),
         cashless_device_address,
         mdb_poll_count,
@@ -2213,6 +2271,11 @@ static void publish_mdb_diag(void) {
         (unsigned long) sale_queue_overflow_count(),
         (unsigned long) sale_queue_last_seq(),
         (unsigned long) sale_queue_fast_path_count(),
+        (unsigned long) dex_polls,
+        (unsigned long) dex_ok,
+        (unsigned long) dex_bytes,
+        dex_try_ms,
+        dex_ok_ms,
         bus);
 
     if (n > 0 && n < MDB_DIAG_MSG_LEN) {
@@ -2469,7 +2532,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 }
 
                 xEventGroupSetBits(xLedEventGroup, BIT_EVT_BUZZER | BIT_EVT_TRIGGER);
-                ESP_LOGI( TAG, "Amount= %f", FROM_SCALE_FACTOR(newFunds, CONFIG_MDB_SCALE_FACTOR, CONFIG_MDB_DECIMAL_PLACES) );
+                ESP_LOGI( TAG, "Amount= %lu.%02lu",
+                          (unsigned long) (mdb_price_to_cents(newFunds) / 100),
+                          (unsigned long) (mdb_price_to_cents(newFunds) % 100) );
 			}
 		}
 

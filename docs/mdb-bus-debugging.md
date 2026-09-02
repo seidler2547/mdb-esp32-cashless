@@ -28,7 +28,8 @@ consequences worth remembering when reading a trace:
 
 | Verdict | Meaning | What to do |
 |---|---|---|
-| `ok` | The VMC is addressing this reader. | The bus is fine; look at the counters for quality problems. |
+| `ok` | The VMC is addressing this reader and has enabled it. | The bus is fine; look at the counters for quality problems. |
+| `polled_not_enabled` | The VMC polls us and we answer, but it has never sent READER ENABLE. | The link is healthy — the reader is switched off in the machine's own service menu. Until it is enabled the reader can hold no session, so it reports neither card sales **nor the VMC's cash sales**. |
 | `reset_loop` | The VMC addresses us but never gets past RESET — it never issues a POLL. | Our replies are not reaching the VMC. Check the transmit side of the harness, and anything that delays the answer past MDB's 5 ms deadline. |
 | `wrong_addr` | The VMC polls the *other* cashless address and never ours. | The machine is configured for the other cashless device. Switch this reader with config command `0x31` (or the `/machines/[id]` MDB address toggle). |
 | `not_enabled` | The bus is busy, but no cashless address is polled at all. | The card reader was never enabled in the vending machine's own setup menu. Nothing on our side will help. |
@@ -85,6 +86,16 @@ every 10 seconds.
 | `rspUs`, `rspMaxUs` | Delay between the VMC's command and the first bit of our answer. MDB allows 5000 µs. |
 | `myCmd` | The commands addressed to *us*, split by type (`reset`, `setup`, `poll`, `vend`, `reader`, `exp`). A high `reset` with `poll` at zero is the `reset_loop` signature. |
 | `addr` | Per-address command counts, keyed by address byte (`"08"`, `"10"`, `"30"` …). |
+| `scale` | The price units we advertised in SETUP CONFIG_DATA: `sf` scale factor, `dp` decimal places. Every `raw` price below is in these units — `{"sf":1,"dp":2}` means cents. Constant for a given build, and the key to reading the numbers next to it. |
+| `lastVend` | The most recent sale as it crossed the bus: `cmd` (`0x21` cash, `0x23` sniffed card, `0x24` cashless), `raw` (the price the VMC sent, in `scale` units), `cents` (what we published), `item`, `ageMs`, plus `n` / `rawMin` / `rawMax` over all sales since the counters were reset. |
+
+Two more objects ride on the `mdb-log` heartbeat and `/api/v1/mdb/diag`
+alongside `bus`:
+
+| Key | Meaning |
+|---|---|
+| `saleQueue` | `lastSeq` is a monotonic lifetime count of sales the firmware has recorded — **zero means it has never seen one**, which places the fault upstream of MQTT entirely. `pending` climbing with `lastSeq` growing is the opposite: sales exist and are not being delivered. `overflow` counts sales that did not fit the 512-entry offline buffer. |
+| `dex` | Hourly audit health: `polls` attempted, `ok` that produced bytes, `bytes` in the last snapshot, `lastTryMs` / `lastOkMs` ages (`-1` = never). The audit is the only sales path that does not need the reader enabled, so on a machine reporting nothing it is the other half of the answer. `polls` climbing with `lastOkMs` at `-1` means the audit port was never wired up or does not answer. |
 
 ## Reading a trace
 
@@ -150,6 +161,10 @@ reset.
 | We answer, the machine ignores us | `txBlk` > 0 but `ack` = 0 | Strongly suggests the transmit path is dead — the VMC never confirms a single block of ours. |
 | Intermittent failures, occasional vends | `frmErr`, `chkErr`, `gapErr`, `shortBlk` climbing | Electrical: grounding, cable length, interference. Pull a trace and look for `!` and large `/N` gaps mid-block. |
 | Worked, then stopped | `sil` > 0, `maxSilMs` large, `verdict=bus_silent` | The machine or the harness dropped out. The snapshot taken at that moment shows the last bytes before it went quiet. |
+| No sales at all, neither card nor cash | `verdict=polled_not_enabled`, `myCmd.reader` = 0, `saleQueue.lastSeq` = 0 | The reader is not switched on in the machine's service menu. A VMC will not send CASH SALE to a reader it has not enabled either, which is why *both* kinds of sale vanish together. |
+| No sales, and the reader is enabled | `verdict=ok`, `myCmd.vend` = 0, `saleQueue.lastSeq` = 0, `dex.lastOkMs` = -1 | Nothing has been sold, or nothing reports it: no VEND has ever been addressed to us and the audit port has never answered. Check the DEX harness before suspecting the MDB side. |
+| Sales arrive but every price is the same | `lastVend.rawMin` == `rawMax` over many sales | The VMC really is sending one price. Either its selections are all programmed to that price, or `scale` is too coarse to express them: at `{"sf":100,"dp":2}` one unit **is** 1.00, so every shelf price rounds to a whole euro. Compare `raw` against the price on the front of the machine. |
+| Prices land one cent low | `lastVend.raw` right, `cents` one less | Firmware from before the `mdb_price.h` fix. The old `pow()`-based conversion truncated: 2.05 was published as 2.04. Sixteen of the first 401 prices were affected. |
 
 ## Why nothing logs from the bus task
 

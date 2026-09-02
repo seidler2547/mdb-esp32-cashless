@@ -5,16 +5,13 @@ import { stockUrgency } from './stock-urgency.ts'
 import { t, formatPrice, type Locale } from '../_shared/notification-i18n.ts'
 import { decideSuppress, rebootCorroborates, REBOOT_CORRELATION_WINDOW_MS, REBOOT_CORRELATION_FORWARD_MS, SUPPRESS_WINDOW_MS, type SuppressCandidate } from "./suppress.ts";
 import { applyItemOffset, shiftSlotCounters } from './slot-offset.ts';
+import { centsToCurrency } from './price.ts';
 
 // Sale payload format version carried in byte 1 of the 19-byte XOR-encrypted
 // payload. v2 adds per-device monotonic sale_seq (bytes 14-17) + time_uncertain
 // flag (byte 12 bit 0) so replays from the firmware queue or broker retention
 // can be de-duplicated at the DB layer.
 const SALE_PAYLOAD_V2 = 0x02;
-
-function fromScaleFactor(p: number, x: number, y: number): number {
-  return p * x * Math.pow(10, -y);
-}
 
 // --- DEX / EVA-DTS audit parser -------------------------------------------
 // Extracts per-slot cumulative vend counters from a DEX audit stream. We only
@@ -434,7 +431,7 @@ Deno.serve(async (req) => {
       // 0x21 = CASH_SALE (coin/bill), 0x23 = CARD_SALE (credit card / cashless device #2), 0x24 = CASHLESS_SALE
       const channel = cmd === 0x23 ? 'card' : cmd === 0x24 ? 'cashless' : 'cash';
 
-      const salePrice = fromScaleFactor(itemPrice >>> 0, 1, 2);
+      const salePrice = centsToCurrency(itemPrice >>> 0);
 
       // Older v1 payloads have no idempotency info — those stay best-effort.
       let saleSeq: number | null = null;

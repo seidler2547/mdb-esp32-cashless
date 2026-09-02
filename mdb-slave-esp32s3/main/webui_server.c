@@ -478,8 +478,8 @@ static esp_err_t wifi_scan_get_handler(httpd_req_t *req) {
  * exactly this, and on cellular boards it is up permanently anyway.
  */
 
-#define MDB_HTTP_BUS_LEN     896
-#define MDB_HTTP_DIAG_LEN   1280
+#define MDB_HTTP_BUS_LEN    1408   /* see MDB_BUS_JSON_LEN */
+#define MDB_HTTP_DIAG_LEN   2048
 #define MDB_HTTP_TRACE_LEN  4096
 
 /* GET /api/v1/mdb/diag — counters, address map and verdict as JSON. */
@@ -494,9 +494,15 @@ static esp_err_t mdb_diag_get_handler(httpd_req_t *req) {
 
     if (mdb_debug_json(bus, MDB_HTTP_BUS_LEN) == 0) strcpy(bus, "{}");
 
+    uint32_t dex_polls, dex_ok, dex_bytes;
+    long dex_try_ms, dex_ok_ms;
+    mdb_dex_stats(&dex_polls, &dex_ok, &dex_bytes, &dex_try_ms, &dex_ok_ms);
+
     snprintf(body, MDB_HTTP_DIAG_LEN,
         "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,"
-        "\"lastCmd\":\"%s\",\"vmcLevel\":%u,\"traceEntries\":%u,\"snapshot\":%s,\"bus\":%s}",
+        "\"lastCmd\":\"%s\",\"vmcLevel\":%u,\"traceEntries\":%u,\"snapshot\":%s,"
+        "\"dex\":{\"polls\":%lu,\"ok\":%lu,\"bytes\":%lu,\"lastTryMs\":%ld,\"lastOkMs\":%ld},"
+        "\"bus\":%s}",
         mdb_state_name(),
         mdb_configured_address(),
         (unsigned long) mdb_poll_total(),
@@ -505,6 +511,11 @@ static esp_err_t mdb_diag_get_handler(httpd_req_t *req) {
         mdb_vmc_level(),
         (unsigned) mdb_debug_trace_count(),
         mdb_debug_snapshot_ready() ? "true" : "false",
+        (unsigned long) dex_polls,
+        (unsigned long) dex_ok,
+        (unsigned long) dex_bytes,
+        dex_try_ms,
+        dex_ok_ms,
         bus);
 
     httpd_resp_set_type(req, "application/json");
