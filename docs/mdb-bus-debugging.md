@@ -190,14 +190,86 @@ anywhere on the board — the only two are +3V3 and `vin` — so the high side o
 any level shifter has to be powered from the machine or from a separate
 supply, never from `J3`.
 
-A level shifter alone is not automatically enough. It assumes the machine's
-audit port is push-pull logic at the voltage you shift to. Audit ports are
-also built as RS-232 (±12 V, inverted) and as opto-isolated current loops,
-and a plain 3.3↔5 V shifter will be destroyed by the first and will not work
-with the second. Meter the port before wiring. Note also that the MDB signal
-lines are opto-isolated on this board (U1/U4, TLP785) while the board's
-ground is MDB *power* ground — bonding a machine ground to it through the
-audit port is a decision to make deliberately, not by accident.
+What goes between `J8` and the machine depends on what the machine's port
+actually is — see the next two sections. One thing to decide deliberately
+rather than by accident, whichever it turns out to be: the MDB *signal* lines
+are opto-isolated on this board (U1/U4, TLP785), but the board's ground is
+MDB *power* ground. Wiring the machine's sleeve to `J8` pin 1 bonds those two
+references together. Usually they are the same chassis ground and it is fine;
+keeping them apart means an ADuM1201-class digital isolator or a pair of
+optocouplers, and an isolated supply for the far side that this board cannot
+provide.
+
+### What the machine's audit port looks like
+
+EVA-DTS 6.1.1 §7.3 pins the hardwired physical layer down exactly, and it is
+worth reading before buying anything:
+
+* The connector is a **¼" (6.35 mm) three-circuit stereo jack** — a female
+  socket on the machine, a male plug on the cable. **Tip** is the machine's
+  transmit, **ring** is the machine's receive, **sleeve** is signal ground.
+* Signalling is **RS-232C bipolar levels**, with one exception: the machine
+  *may* transmit at TTL unipolar levels (0 to +5 V). It must be able to
+  *receive* either, which is why our transmit side is the easy direction.
+* 9600 baud, 8 data bits, no parity, one stop bit — what `telemetry_task`
+  already configures on UART1.
+
+That exception is the whole decision. The machine's transmit line is either
+RS-232 (idle **negative**, −5 to −12 V, and inverted with respect to a UART)
+or TTL (idle at **+5 V**), and the two need different hardware. Meter tip to
+sleeve with the machine powered and nothing plugged in, before buying
+anything:
+
+| Idle voltage on tip | Port type | What it needs |
+|---|---|---|
+| −5 V to −12 V | RS-232 | A MAX3232 (it runs from 3.3 V) plus its four 100 nF charge-pump capacitors, powered from `J8` pin 2. It level-shifts *and* un-inverts, in both directions. A 3.3↔5 V level shifter does neither and will be damaged by the negative swing. |
+| ≈ +5 V | TTL unipolar | The two-transistor buffer below, or the two-resistor minimum after it. |
+| ≈ 0 V, or it sags as soon as you load it | Probably a current loop | Neither of the above; it needs an opto front end and a source of loop current. |
+
+Not every machine follows the standard: plenty put the audit port on an
+internal header or a manufacturer-specific plug instead of the ¼" jack. The
+signalling is usually still one of the three above, so meter it either way.
+
+### Parts for a TTL port
+
+The cellular board already carries a working interface for exactly this case,
+and it is two transistors and four resistors — copy it rather than inventing
+one. Both halves are the same **common-base** stage: the base sits at +3V3
+through 4k7, the other side's line drives the emitter, and the collector,
+pulled up to +3V3 through 10k, carries the shifted copy. It is non-inverting,
+and it tolerates 5 V on the emitter because the base-emitter junction only
+ever sees about 1.7 V in reverse.
+
+| Ref on `kicad/mdb-slave-esp32s3-sim7080g` | Part | Wiring |
+|---|---|---|
+| Q5 | MMBT3904 (SOT-23) or a 2N3904 | base ← R21; emitter = machine tip; collector = ESP RX |
+| R21 | 4.7 kΩ | +3V3 → Q5 base |
+| R20 | 10 kΩ | +3V3 → ESP RX (Q5 collector) |
+| Q6 | MMBT3904 or 2N3904 | base ← R23; emitter = ESP TX; collector = machine ring |
+| R23 | 4.7 kΩ | +3V3 → Q6 base |
+| R22 | 10 kΩ | +3V3 → machine ring (Q6 collector) |
+
+Board side, `J8` is a **JST PH 2.00 mm 4-pin vertical** header (B4B-PH-K,
+LCSC C131334). The mating half is a PHR-4 housing with SPH-002T crimps, sold
+ready-made as a "JST PH 2.0 4-pin pigtail". Pin 1 GND, pin 2 +3V3, pin 3
+GPIO10, pin 4 GPIO11.
+
+**The two-resistor minimum**, if the port measures TTL: a 10 kΩ / 20 kΩ
+divider from tip down to GPIO10 turns the machine's 5 V into 3.3 V, and
+GPIO11 drives the machine's ring directly — the standard requires the machine
+to accept TTL, and 3.3 V clears a TTL input's 2.0 V threshold. Both
+directions are covered. At 9600 baud the divider's time constant is three
+orders of magnitude away from mattering. This is less forgiving than the
+transistor buffer of a port that turns out to swing higher than 5 V, so
+measure first.
+
+**A 3.3↔5 V level-shifter module** (the BSS138 kind) works electrically for a
+TTL port, but note two things: each DEX line is unidirectional, so it needs
+two channels wired one per direction, and its high-side rail has to come from
+somewhere. This board has only +3V3 and `vin` — **there is no 5 V rail** — so
+the module's HV pin needs 5 V from the machine or a separate supply. The
+transistor buffer above sidesteps that entirely by running from +3V3 alone,
+which is why the cellular board uses it.
 
 ## Debug levels
 
