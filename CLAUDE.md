@@ -128,6 +128,15 @@ So a WiFi board cannot reach a machine's audit port without adding that
 interface. `dex.polls` climbing with `lastOkMs` at -1 on such a board is
 expected, not a fault.
 
+The pins are set by `CONFIG_DEX_RX_GPIO` / `CONFIG_DEX_TX_GPIO` (menuconfig,
+default 8/9) and reported back as `dex.rx` / `dex.tx`. Retrofitting a WiFi
+board means taking the **I2C connector `J8`** (GND, +3V3, GPIO10, GPIO11) —
+the only connector with two free signals, a ground and a logic rail, and
+GPIO10/11 are unused by the firmware. The pulse connector `J3` cannot serve:
+its only signal pin is the collector of output-only Q7, and its second pin is
+`vin`, the raw MDB supply into an LM2594HV rated to 60 V. The board has no
+5 V rail at all. Full guidance in `docs/mdb-bus-debugging.md`.
+
 **Price conversion (`mdb_price.h`)**: MDB carries prices as a 16-bit count of
 scale-factor units, and the *reader* dictates the unit via the scale factor
 and decimal places it puts in its SETUP CONFIG_DATA answer. `mdb_price.h`

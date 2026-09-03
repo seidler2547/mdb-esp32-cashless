@@ -67,6 +67,32 @@ menu "MDB Cashless Device"
         default 2
         range 0 3
 
+    config DEX_RX_GPIO
+        int "DEX audit RX GPIO (line the board listens on)"
+        default 8
+        range 0 48
+        help
+            UART1 receive pin for the EVA-DTS audit port, 9600 8N1.
+
+            Default 8 matches the `dex/rx` net in kicad/. On the WiFi board
+            that net has no connector and no interface circuit behind it -
+            GPIO8/9 reach only the 2x11 expansion header J4, pins 4 and 6,
+            as bare 3.3 V logic. Repurposing the I2C connector J8 (GND,
+            +3V3, GPIO10, GPIO11) is the usual way to get the audit port
+            onto a plug on that board; set this to 10 and DEX_TX_GPIO to 11
+            if you do, and give up I2C.
+
+            Do not use the pulse connector J3: only one of its pins is a
+            signal, it is the collector of an output-only transistor, and
+            its second pin carries the raw MDB supply, not a logic rail.
+
+    config DEX_TX_GPIO
+        int "DEX audit TX GPIO (line the board drives)"
+        default 9
+        range 0 48
+        help
+            UART1 transmit pin for the EVA-DTS audit port. See DEX_RX_GPIO.
+
     config MDB_SNIFF_OTHER_CASHLESS
         bool "Sniff other cashless device (credit card detection)"
         default y

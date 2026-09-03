@@ -166,12 +166,38 @@ DDCMP framing. Pin names on `J3` are from the board's point of view: `dex_rx`
 is the line the board listens on.
 
 On a WiFi board, "no DEX data" is the expected result, not a fault — there is
-nothing to plug in to. Reaching a machine's audit port from one means adding
-the buffer stage the cellular board carries, wired to `J4` pins 4 and 6.
-Check the levels and connector of the specific machine's audit port against
-its own manual and `EVA-DTS 6.1.1 NEW.pdf` in the repo root before connecting
-anything: GPIO8 is a bare SoC pin on that board, with no series resistor, no
-clamp and no isolation between it and whatever the machine presents.
+nothing to plug in to. Check the levels and connector of the specific
+machine's audit port against its own manual and `EVA-DTS 6.1.1 NEW.pdf` in
+the repo root before connecting anything: GPIO8 is a bare SoC pin on that
+board, with no series resistor, no clamp and no isolation between it and
+whatever the machine presents.
+
+### Retrofitting the audit port onto a WiFi board
+
+Use the **I2C connector `J8`** — GND, +3V3, GPIO10, GPIO11. It is the only
+connector that carries two free signals, a ground and a logic rail, and the
+firmware never touches GPIO10/11 (the only I2C in the codebase is the
+cellular board's PMU, on GPIO15/7), so nothing is lost by taking it. Set
+`DEX_RX_GPIO` to 10 and `DEX_TX_GPIO` to 11 in menuconfig; both are reported
+back as `dex.rx` / `dex.tx` so a device can be checked against its wiring.
+
+**Do not use the pulse connector `J3`.** Only its pin 3 is a signal, and that
+is the collector of Q7 — an output-only open-collector transistor driven from
+GPIO13 through a 4k7 base resistor, so there is no way to receive on it and
+no second line for the other direction. Its pin 2 is `vin`: the **raw MDB
+supply**, feeding an LM2594HV that tolerates up to 60 V. There is no 5 V rail
+anywhere on the board — the only two are +3V3 and `vin` — so the high side of
+any level shifter has to be powered from the machine or from a separate
+supply, never from `J3`.
+
+A level shifter alone is not automatically enough. It assumes the machine's
+audit port is push-pull logic at the voltage you shift to. Audit ports are
+also built as RS-232 (±12 V, inverted) and as opto-isolated current loops,
+and a plain 3.3↔5 V shifter will be destroyed by the first and will not work
+with the second. Meter the port before wiring. Note also that the MDB signal
+lines are opto-isolated on this board (U1/U4, TLP785) while the board's
+ground is MDB *power* ground — bonding a machine ground to it through the
+audit port is a decision to make deliberately, not by accident.
 
 ## Debug levels
 

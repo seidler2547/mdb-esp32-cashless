@@ -59,8 +59,11 @@
 #define PIN_MDB_RX              GPIO_NUM_4
 #define PIN_MDB_TX              GPIO_NUM_5
 #define PIN_MDB_LED             GPIO_NUM_21
-#define PIN_DEX_RX              GPIO_NUM_8
-#define PIN_DEX_TX              GPIO_NUM_9
+/* Configurable: the WiFi board brings these out only on the raw expansion
+ * header, so a board that needs the audit port on a plug is usually rewired
+ * onto the I2C connector. menuconfig -> "MDB Cashless Device". */
+#define PIN_DEX_RX              ((gpio_num_t) CONFIG_DEX_RX_GPIO)
+#define PIN_DEX_TX              ((gpio_num_t) CONFIG_DEX_TX_GPIO)
 #define PIN_SIM7080G_RX         GPIO_NUM_18
 #define PIN_SIM7080G_TX         GPIO_NUM_17
 #define PIN_SIM7080G_PWR        GPIO_NUM_14
@@ -2299,7 +2302,8 @@ static void publish_mdb_diag(void) {
     int n = snprintf(msg, MDB_DIAG_MSG_LEN,
         "{\"state\":\"%s\",\"addr\":\"0x%02X\",\"polls\":%lu,\"chkErr\":%lu,\"lastCmd\":\"%s\",\"vmcLevel\":%u,"
         "\"saleQueue\":{\"pending\":%lu,\"overflow\":%lu,\"lastSeq\":%lu,\"fastPath\":%lu},"
-        "\"dex\":{\"polls\":%lu,\"ok\":%lu,\"bytes\":%lu,\"lastTryMs\":%ld,\"lastOkMs\":%ld},"
+        "\"dex\":{\"polls\":%lu,\"ok\":%lu,\"bytes\":%lu,\"lastTryMs\":%ld,\"lastOkMs\":%ld"
+        ",\"rx\":%u,\"tx\":%u},"
         "\"bus\":%s}",
         machine_state_name(machine_state),
         cashless_device_address,
@@ -2316,6 +2320,8 @@ static void publish_mdb_diag(void) {
         (unsigned long) dex_bytes,
         dex_try_ms,
         dex_ok_ms,
+        (unsigned) CONFIG_DEX_RX_GPIO,
+        (unsigned) CONFIG_DEX_TX_GPIO,
         bus);
 
     if (n > 0 && n < MDB_DIAG_MSG_LEN) {
