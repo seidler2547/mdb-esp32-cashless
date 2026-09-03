@@ -31,7 +31,9 @@ Single main file `main/mdb-slave-esp32s3.c` runs these concurrent FreeRTOS tasks
 - `mdb_cashless_loop` – MDB protocol handler on UART2 (GPIO4 RX, GPIO5 TX, 9600 baud, 9-bit mode)
 - `bleprph_host_task` – NimBLE BLE peripheral (in `nimble.c`) for legacy device config and vend approvals
 - MQTT client over WiFi for credit delivery and sales publishing
-- Telemetry reader on UART1 (GPIO43 TX, GPIO44 RX) for DEX/DDCMP data
+- Telemetry reader on UART1 (GPIO9 TX, GPIO8 RX) for DEX/DDCMP data — see
+  "DEX wiring" below; GPIO43/44 named here previously are the ESP32-S3's
+  default UART0 console pins, not this
 
 **MDB State machine**: `INACTIVE → DISABLED → ENABLED → IDLE → VEND → IDLE`
 
@@ -109,6 +111,22 @@ minutes in, because a periodic timer's first fire is one full period away —
 so before this a device rebooted with the machine had no audit data at all
 for an hour, which is exactly the window in which someone is standing in
 front of it asking where the cash sales went.
+
+**DEX wiring**: the audit UART is GPIO9 (TX, to the machine) / GPIO8 (RX,
+from the machine), and the two boards expose it very differently.
+
+- `kicad/mdb-slave-esp32s3` (WiFi) has **no DEX connector and no DEX
+  interface circuit** — the schematic has no `dex_*` net at all. GPIO8/9
+  reach only the 2×11 expansion header `J4`, at pins 4 and 6 (silkscreened
+  `08` and `09`), as bare 3.3 V logic straight off the SoC.
+- `kicad/mdb-slave-esp32s3-sim7080g` (cellular) has both: connector `J3`
+  (3-pin: GND / `dex_rx` / `dex_tx`) driven through a discrete open-collector
+  buffer — Q5 and Q6 (MMBT3904) with R20–R23 pull-ups to +3V3. Signal
+  reference is board ground; there is no galvanic isolation.
+
+So a WiFi board cannot reach a machine's audit port without adding that
+interface. `dex.polls` climbing with `lastOkMs` at -1 on such a board is
+expected, not a fault.
 
 **Price conversion (`mdb_price.h`)**: MDB carries prices as a 16-bit count of
 scale-factor units, and the *reader* dictates the unit via the scale factor

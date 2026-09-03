@@ -150,6 +150,29 @@ argument about a price:
 really did send 1.50. If the machine's front label says something else, the
 fault is in its price programming, not in the reader.
 
+## Is the DEX port even wired?
+
+`dex.polls` climbing with `lastOkMs` stuck at `-1` means the audit ran and
+nothing answered. Before suspecting the machine, check that the board has a
+DEX interface at all — the two revisions differ:
+
+| Board | DEX connector | Interface |
+|---|---|---|
+| `kicad/mdb-slave-esp32s3` (WiFi) | **none** | none — the schematic has no `dex_*` net. GPIO8/9 appear only on the 2×11 expansion header `J4`, pins 4 and 6 (silkscreen `08` / `09`), as bare 3.3 V logic. |
+| `kicad/mdb-slave-esp32s3-sim7080g` (cellular) | `J3`, 3-pin: GND / `dex_rx` / `dex_tx` | Q5, Q6 (MMBT3904) open-collector buffer with R20–R23 pull-ups to +3V3. No galvanic isolation. |
+
+The UART is GPIO9 TX (to the machine), GPIO8 RX (from the machine), 9600 8N1,
+DDCMP framing. Pin names on `J3` are from the board's point of view: `dex_rx`
+is the line the board listens on.
+
+On a WiFi board, "no DEX data" is the expected result, not a fault — there is
+nothing to plug in to. Reaching a machine's audit port from one means adding
+the buffer stage the cellular board carries, wired to `J4` pins 4 and 6.
+Check the levels and connector of the specific machine's audit port against
+its own manual and `EVA-DTS 6.1.1 NEW.pdf` in the repo root before connecting
+anything: GPIO8 is a bare SoC pin on that board, with no series resistor, no
+clamp and no isolation between it and whatever the machine presents.
+
 ## Debug levels
 
 Set with config command `0x34` or `POST /api/v1/mdb/debug`; stored in NVS
