@@ -317,6 +317,30 @@ static esp_timer_handle_t mdb_diag_defer_timer = NULL;
 static volatile bool mdb_diag_pending = false;        /* set inside the bus loop     */
 static machine_state_t mdb_diag_from_state = INACTIVE_STATE;
 
+/* Pending sale, for the same reason.
+ *
+ * sale_queue_enqueue() publishes over MQTT on its fast path and writes NVS on
+ * its slow one — hundreds of microseconds at best, tens of milliseconds when
+ * the publish mutex is contended or a sequence chunk has to be flushed. It
+ * was called straight from the VEND_SUCCESS and CASH_SALE handlers, i.e.
+ * between the VMC's command and our answer to it, which is the one place
+ * nothing slow may go: a field device measured a worst-case response of
+ * 13.2 ms against MDB's 5 ms budget, and took a NAK for it.
+ *
+ * The handler now fills this slot and the flush happens immediately after
+ * write_payload_9() has put the answer on the wire. sale_queue.h's guarantee
+ * that a sale is persisted before the VMC is answered is what moves here:
+ * the window it trades away is the few hundred microseconds of one MDB
+ * frame, and blowing the response deadline risks the VMC resetting the
+ * reader mid-session, which loses the sale far more surely than a power cut
+ * inside that frame would. */
+static struct {
+    bool     valid;
+    uint8_t  cmd;
+    uint16_t price;
+    uint16_t item;
+} mdb_pending_sale;
+
 static void request_mdb_diag_publish(void) {
     if (!mdb_diag_defer_timer) return;
     esp_timer_stop(mdb_diag_defer_timer);   /* no-op when idle; restarts the window */
@@ -676,6 +700,27 @@ void write_payload_9(uint8_t *mdb_payload, uint8_t length) {
 }
 
 void xorEncodeWithPasskey(uint8_t cmd, uint16_t itemPrice, uint16_t itemNumber, uint16_t paxCounter, uint8_t *payload);
+
+/* Hand a recorded sale to the persistent queue. Called from the bus task the
+ * instant its answer is on the wire, so the cost lands in the idle gap before
+ * the next command rather than inside the response window.
+ *
+ * The fallback is the pre-queue direct publish, kept so behaviour never
+ * degrades below the old firmware when NVS is unavailable. */
+static void mdb_flush_pending_sale(uint8_t cmd, uint16_t price, uint16_t item) {
+
+    mdb_debug_note_vend(cmd, price, item, mdb_price_to_cents(price));
+
+    if (sale_queue_enqueue(cmd, price, item)) return;
+
+    uint8_t payload[19];
+    xorEncodeWithPasskey(cmd, price, item, 0, payload);
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "/%s/%s/sale", my_company_id, my_device_id);
+    mqtt_publish_safe(mqttClient, topic, (char *) payload, sizeof(payload), 1, 0);
+    mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for cmd 0x%02X", cmd);
+}
 uint8_t xorDecodeWithPasskey(uint16_t *itemPrice, uint16_t *itemNumber, uint8_t *payload);
 
 // Drain any remaining bytes from the MDB bus after a checksum error or
@@ -1061,7 +1106,8 @@ void vTaskMdbEvent(void *pvParameters) {
 					break;
 				}
 				case VEND: {
-					switch (read_9(&checksum)) {
+					uint8_t vend_sub = read_9(&checksum);
+					switch (vend_sub) {
 					case VEND_REQUEST: {
 
 						itemPrice = (read_9(&checksum) << 8) | read_9(&checksum);
@@ -1071,6 +1117,10 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						machine_state = VEND_STATE;
 						mdb_last_cmd = "VEND_REQUEST";
+						/* After the checksum, so a mis-read block is not what
+						 * gets frozen — and after the price bytes are in the
+						 * trace ring, so the snapshot contains them. */
+						mdb_debug_note_vend_cmd(vend_sub);
 						time(&vend_request_time);
 
                         if(fundsAvailable && (fundsAvailable != 0xffff)){
@@ -1095,6 +1145,7 @@ void vTaskMdbEvent(void *pvParameters) {
                         if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_CANCEL";
+						mdb_debug_note_vend_cmd(vend_sub);
 						vend_denied_todo = true;
 						break;
 					}
@@ -1105,6 +1156,7 @@ void vTaskMdbEvent(void *pvParameters) {
                         if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_SUCCESS";
+						mdb_debug_note_vend_cmd(vend_sub);
 
 						// Guard: only publish sale if we are in VEND_STATE.
 						// VMC retransmissions or bus noise can deliver duplicate
@@ -1129,33 +1181,18 @@ void vTaskMdbEvent(void *pvParameters) {
 
 						machine_state = IDLE_STATE;
 
-						mdb_debug_note_vend(0x24, itemPrice, itemNumber,
-						                    mdb_price_to_cents(itemPrice));
-
 						/* PIPE_BLE — immediate notify to companion app */
 						uint8_t payload_ble[19];
 						xorEncodeWithPasskey(0x0b, itemPrice, itemNumber, 0, (uint8_t*) &payload_ble);
 
                         ble_notify_send((char*) &payload_ble, sizeof(payload_ble));
 
-						/* PIPE_MQTT — persist to NVS-backed queue BEFORE responding
-						 * to the VMC.  Even a crash or power-loss after this point
-						 * leaves the sale durably recorded; the drain task will
-						 * publish it (or re-publish after reboot) with broker QoS 1
-						 * + backend idempotency protecting against duplicates.
-						 *
-						 * Fallback: if the queue is unavailable (NVS error, init
-						 * failure, or capacity exhausted) fall back to the legacy
-						 * direct-publish path so behaviour never degrades below
-						 * the pre-queue firmware. */
-						if (!sale_queue_enqueue(0x24, itemPrice, itemNumber)) {
-							uint8_t payload_mqtt[19];
-							xorEncodeWithPasskey(0x24, itemPrice, itemNumber, 0, (uint8_t*) &payload_mqtt);
-							char topic_sale[128];
-							snprintf(topic_sale, sizeof(topic_sale), "/%s/%s/sale", my_company_id, my_device_id);
-							mqtt_publish_safe(mqttClient, topic_sale, (char*) &payload_mqtt, sizeof(payload_mqtt), 1, 0);
-							mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for VEND_SUCCESS");
-						}
+						/* PIPE_MQTT — queued here, flushed the moment our answer
+						 * is on the wire. See mdb_pending_sale. */
+						mdb_pending_sale.cmd   = 0x24;
+						mdb_pending_sale.price = itemPrice;
+						mdb_pending_sale.item  = itemNumber;
+						mdb_pending_sale.valid = true;
 
 						mdb_log_defer(ESP_LOG_INFO, "VEND_SUCCESS price=%u item=%u", itemPrice, itemNumber);
 
@@ -1169,6 +1206,7 @@ void vTaskMdbEvent(void *pvParameters) {
                         if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "VEND_FAILURE";
+						mdb_debug_note_vend_cmd(vend_sub);
 
 						if (machine_state != VEND_STATE) {
 						    mdb_log_defer(ESP_LOG_WARN, "VEND_FAILURE ignored — not in VEND_STATE (state=%d)", machine_state);
@@ -1188,6 +1226,7 @@ void vTaskMdbEvent(void *pvParameters) {
                         if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "SESSION_COMPLETE";
+						mdb_debug_note_vend_cmd(vend_sub);
 						session_end_todo = true;
 
 			            /* PIPE_BLE */
@@ -1207,19 +1246,13 @@ void vTaskMdbEvent(void *pvParameters) {
 						if (read_9(NULL) != checksum) { mdb_checksum_errors++; mdb_debug_note_chk_err(); mdb_drain_bus(); continue; }
 
 						mdb_last_cmd = "CASH_SALE";
+						mdb_debug_note_vend_cmd(vend_sub);
 
-                        mdb_debug_note_vend(0x21, itemPrice, itemNumber,
-                                            mdb_price_to_cents(itemPrice));
-
-                        /* Persistent queue handles publish + retry — see VEND_SUCCESS */
-                        if (!sale_queue_enqueue(0x21, itemPrice, itemNumber)) {
-                            uint8_t payload[19];
-                            xorEncodeWithPasskey(0x21, itemPrice, itemNumber, 0, (uint8_t*) &payload);
-                            char topic[128];
-                            snprintf(topic, sizeof(topic), "/%s/%s/sale", my_company_id, my_device_id);
-                            mqtt_publish_safe(mqttClient, topic, (char*) &payload, sizeof(payload), 1, 0);
-                            mdb_log_defer(ESP_LOG_WARN, "sale_queue fallback: direct publish (v1) for CASH_SALE");
-                        }
+                        /* Deferred past our answer — see mdb_pending_sale. */
+                        mdb_pending_sale.cmd   = 0x21;
+                        mdb_pending_sale.price = itemPrice;
+                        mdb_pending_sale.item  = itemNumber;
+                        mdb_pending_sale.valid = true;
 
                         mdb_log_defer(ESP_LOG_INFO, "CASH_SALE");
 						break;
@@ -1357,6 +1390,13 @@ void vTaskMdbEvent(void *pvParameters) {
 
 				// Anything that wants to touch the network waits until the
 				// answer is on the wire, never between command and response.
+				if (mdb_pending_sale.valid) {
+					mdb_pending_sale.valid = false;
+					mdb_flush_pending_sale(mdb_pending_sale.cmd,
+					                       mdb_pending_sale.price,
+					                       mdb_pending_sale.item);
+				}
+
 				if (mdb_diag_pending) {
 					mdb_diag_pending = false;
 					request_mdb_diag_publish();
@@ -2459,6 +2499,34 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
         xEventGroupSetBits(xLedEventGroup, BIT_EVT_INTERNET | BIT_EVT_TRIGGER);
 
+        /* First DEX audit shortly after the uplink comes up.
+         *
+         * The audit timer is periodic with a one-hour period, so its first
+         * fire is an hour after boot — a device that is power-cycled with the
+         * machine, or that reboots for any reason, therefore has no audit
+         * data at all for the first hour, and `dex.polls` sits at 0. That is
+         * the window in which someone is most likely to be standing in front
+         * of the machine asking why cash sales are missing, and the audit is
+         * the only route cash takes when the VMC does not send CASH SALE.
+         *
+         * Armed here rather than at boot because telemetry_task publishes
+         * what it reads: firing before MQTT is up would burn the snapshot.
+         * Two minutes is well clear of the connect, and one-shot, so the
+         * hourly rhythm is unchanged. */
+        {
+            static esp_timer_handle_t dex_boot_timer = NULL;
+            if (!dex_boot_timer) {
+                const esp_timer_create_args_t args = {
+                    .callback = &requestTelemetryData,
+                    .name = "dex_boot"
+                };
+                if (esp_timer_create(&args, &dex_boot_timer) == ESP_OK) {
+                    esp_timer_start_once(dex_boot_timer, 120 * 1000000ULL);
+                    ESP_LOGI(TAG, "DEX telemetry: first audit scheduled in 120s");
+                }
+            }
+        }
+
         // Start MDB diagnostics timer (30s interval)
         {
             static esp_timer_handle_t mdb_diag_timer = NULL;
@@ -3542,6 +3610,9 @@ void app_main(void) {
     // pipeline (see dex_reconcile_gaps migration). 12h was too coarse to
     // catch short outages; 1h trades flash + UART time for meaningful
     // reconciliation resolution.
+    // Note this is the *steady-state* rhythm only: a periodic timer first
+    // fires one full period in, so the boot-time audit is armed separately
+    // from the MQTT connect handler.
     const double INTERVAL_1H_US = 60ULL * 60 * 1000000; // 1h in microseconds
 
 	const esp_timer_create_args_t periodic_timer_args = {

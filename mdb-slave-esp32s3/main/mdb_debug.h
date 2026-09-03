@@ -121,6 +121,23 @@ void mdb_debug_note_reader_enabled(void);
  * recoverable after the fact from the sales table alone. */
 void mdb_debug_note_vend(uint8_t cmd, uint16_t raw, uint16_t item, uint32_t cents);
 
+/* One VEND subcommand addressed to us, by its subcommand byte (MDB/ICP 4.2
+ * section 7.4: 0x00 REQUEST, 0x01 CANCEL, 0x02 SUCCESS, 0x03 FAILURE,
+ * 0x04 SESSION COMPLETE, 0x05 CASH SALE).
+ *
+ * CASH SALE is the VMC's optional report of a coin/note purchase to the
+ * cashless device, and plenty of VMCs simply never send it. A `cash` count
+ * still at zero after a day of cash trade says so outright, which is the
+ * difference between "our cash handling is broken" and "this machine does
+ * not report cash over MDB, so the DEX audit is the only route".
+ *
+ * VEND REQUEST additionally freezes a trace snapshot, so the price bytes are
+ * kept exactly as they arrived. A vend is far rarer than a bus error and the
+ * ring holds only seconds of idle polling, so it takes the snapshot slot
+ * unconditionally - by the time anyone looks at a disputed price, the bytes
+ * would otherwise be long gone. */
+void mdb_debug_note_vend_cmd(uint8_t sub);
+
 /* ---------- reporting (any task) ---------- */
 
 /* Micro-verdict for the current bus situation - see MDB_VERDICT_*. */

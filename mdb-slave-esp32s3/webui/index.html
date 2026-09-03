@@ -1069,6 +1069,21 @@
     return line;
   }
 
+  /* CASH SALE is optional in MDB and many VMCs never send it. Once the reader
+   * has seen vends, a cash count still at zero is the machine telling you it
+   * does not report cash over the bus at all — at which point the hourly DEX
+   * audit is the only route, and no amount of MDB debugging will help. */
+  function mdbVendCmdSummary(v) {
+    var line = "request " + v.req + ", success " + v.succ + ", failure " + v.fail +
+               "\ncancel " + v.cancel + ", complete " + v.done + ", cash sale " + v.cash;
+    if (v.req > 0 && v.cash === 0) {
+      line += "\nThis machine has never reported a cash sale over MDB. If cash " +
+              "purchases are missing, that is why — the DEX audit below is the " +
+              "only route for them.";
+    }
+    return line;
+  }
+
   function mdbVendSuspect(bus) {
     var v = bus.lastVend;
     return !!(v && v.n > 2 && v.rawMin === v.rawMax);
@@ -1142,6 +1157,9 @@
            bus.rspMaxUs > 5000);
     mdbRow(dl, "Silent periods", bus.sil + " (longest " + bus.maxSilMs + " ms)", bus.sil > 0);
     mdbRow(dl, "Addresses seen", mdbAddrSummary(bus.addr));
+    if (bus.vendCmd) {
+      mdbRow(dl, "Vend commands", mdbVendCmdSummary(bus.vendCmd));
+    }
     mdbRow(dl, "Last sale", mdbVendSummary(bus), mdbVendSuspect(bus));
     /* Older firmware sends no dex object at all — leave the row out rather
      * than showing an empty one in red, same as the panel hides itself when

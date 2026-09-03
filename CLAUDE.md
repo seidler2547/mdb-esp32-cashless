@@ -59,6 +59,14 @@ us and we answer, but it never sent READER ENABLE, so no session can open and
 received byte is known to come from the VMC, which makes the address map
 exact rather than heuristic.
 
+`vendCmd` tallies the VEND subcommands the VMC sends us. `cash` is the one
+that matters when cash sales are missing: CASH SALE is optional in MDB and
+many VMCs never send it, so `req > 0` with `cash` at 0 says outright that
+this machine does not report cash over the bus and the DEX audit is the only
+route. A VEND REQUEST also freezes a trace snapshot — overriding the error
+snapshot's rate limit, because the 256-entry ring holds only seconds of idle
+polling and the price bytes are what anyone asks about after a disputed sale.
+
 `lastVend` records the most recent sale as it crossed the wire — the raw
 16-bit price the VMC sent, the cents we published for it, and the running
 min/max of the raw price — beside `scale`, the scale factor and decimal
@@ -84,6 +92,23 @@ Diagnostics never run inside the bit-sampling critical section, and the
 state-change publish is deferred to an esp_timer one-shot that fires only
 after the bus task has put its answer on the wire — an MQTT publish between
 a VMC command and the response can exceed the 5 ms MDB response deadline.
+
+**The sale publish is deferred the same way** (`mdb_pending_sale` /
+`mdb_flush_pending_sale`). `sale_queue_enqueue()` publishes over MQTT on its
+fast path and writes NVS on its slow one, and it used to be called straight
+from the VEND_SUCCESS and CASH_SALE handlers — between the VMC's command and
+our answer. A field device measured a worst-case response of 13.2 ms against
+MDB's 5 ms budget and took a NAK for it. The handler now fills a slot that is
+drained immediately after `write_payload_9()`. This trades away
+`sale_queue.h`'s "persisted before the VMC is answered" guarantee for the
+width of one MDB frame; missing the deadline risks the VMC resetting the
+reader mid-session, which loses the sale far more surely.
+
+**The DEX audit's first poll is armed from the MQTT connect handler**, two
+minutes in, because a periodic timer's first fire is one full period away —
+so before this a device rebooted with the machine had no audit data at all
+for an hour, which is exactly the window in which someone is standing in
+front of it asking where the cash sales went.
 
 **Price conversion (`mdb_price.h`)**: MDB carries prices as a 16-bit count of
 scale-factor units, and the *reader* dictates the unit via the scale factor

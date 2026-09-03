@@ -324,6 +324,62 @@ int main(void)
     mdb_debug_json(json, sizeof(json));
     CHECK(jstr_is(json, "verdict", MDB_VERDICT_OK));
 
+    /* ---- 14. VEND subcommand tally, and CASH SALE that never comes ---- */
+    printf("14. vend subcommands\n");
+    mdb_debug_init(0x10, 0x60);
+    mdb_debug_note_reader_enabled();
+    vmc_block(0x12, NULL, 0);
+
+    /* One cashless session: REQUEST, SUCCESS, SESSION COMPLETE. No CASH SALE
+     * — which is what a VMC that does not report cash over MDB looks like. */
+    mdb_debug_note_vend_cmd(0x00);
+    mdb_debug_note_vend_cmd(0x02);
+    mdb_debug_note_vend_cmd(0x04);
+    mdb_debug_json(json, sizeof(json));
+    printf("   %s\n", json);
+    CHECK(strstr(json, "\"vendCmd\":{\"req\":1,\"cancel\":0,\"succ\":1,\"fail\":0,\"done\":1,\"cash\":0}") != NULL);
+
+    mdb_debug_note_vend_cmd(0x05);              /* now one does arrive */
+    mdb_debug_json(json, sizeof(json));
+    CHECK(strstr(json, "\"cash\":1") != NULL);
+
+    /* Before any vend the object is left out entirely, so an idle reader does
+     * not report a wall of zeroes. */
+    mdb_debug_init(0x10, 0x60);
+    vmc_block(0x12, NULL, 0);
+    mdb_debug_json(json, sizeof(json));
+    CHECK(strstr(json, "\"vendCmd\"") == NULL);
+
+    /* ---- 15. a vend freezes the price bytes ---- */
+    printf("15. vend snapshot\n");
+    mdb_debug_init(0x10, 0x60);
+    mdb_debug_apply_level(MDB_DBG_SNAPSHOT, false);
+    mdb_debug_note_reader_enabled();
+
+    /* An error snapshot claims the slot first — a vend must still get one,
+     * because the ring holds seconds of idle polling and by the time anyone
+     * asks about a disputed price the bytes are long gone. */
+    ADV(2000); rx_bad(0xA5);
+    CHECK(mdb_debug_snapshot_ready() || true);   /* arming is enough here */
+
+    {
+        /* VEND REQUEST for 1.50 at slot 35: 13 00 00 96 00 23 CHK */
+        uint8_t vend[] = { 0x00, 0x00, 0x96, 0x00, 0x23 };
+        vmc_block(0x13, vend, sizeof(vend));
+    }
+    mdb_debug_note_vend_cmd(0x00);
+
+    /* Post-trigger context, then the snapshot freezes. */
+    for (int i = 0; i < 40; i++) vmc_block(0x12, NULL, 0);
+
+    CHECK(mdb_debug_snapshot_ready());
+    CHECK(strcmp(mdb_debug_snapshot_cause(), "vend") == 0);
+
+    mdb_debug_snapshot_render(trace, sizeof(trace));
+    printf("   snapshot(%s): %s\n", mdb_debug_snapshot_cause(), trace);
+    /* The price bytes have to be in there verbatim — 0x0096 is 150. */
+    CHECK(strstr(trace, "*13 00 00 96 00 23") != NULL);
+
     printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

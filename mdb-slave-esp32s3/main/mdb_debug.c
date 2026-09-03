@@ -124,6 +124,9 @@ static uint32_t s_own_cmd[8];
  * path: both are written once per command block at most. */
 static bool s_reader_enabled;
 
+/* VEND subcommands addressed to us, indexed by subcommand byte. */
+static uint32_t s_vend_cmd[8];
+
 static struct {
     uint32_t n;         /* sales recorded since the last counter reset */
     uint8_t  cmd;       /* 0x21 cash / 0x23 sniffed card / 0x24 cashless */
@@ -221,6 +224,21 @@ static void snapshot_arm(const char *cause, bool immediate)
     } else {
         s_snap_post = SNAP_POST_ENTRIES;
     }
+}
+
+/* Freeze the trace around a vend. Unlike an error snapshot this ignores both
+ * the rate limit and any snapshot already in flight: vends are rare, the
+ * price bytes are the whole reason anyone opens a trace after a disputed
+ * sale, and a routine framing error minutes earlier must not be allowed to
+ * hold the slot against one. */
+static void snapshot_arm_vend(void)
+{
+    if (s_level < MDB_DBG_SNAPSHOT) return;
+
+    s_snap_ready   = false;
+    s_snap_cause   = "vend";
+    s_snap_last_us = esp_timer_get_time();
+    s_snap_post    = SNAP_POST_ENTRIES;
 }
 
 static inline void trace_push(uint16_t word, uint32_t t_us)
@@ -350,6 +368,7 @@ void mdb_debug_reset(void)
     memset(s_addr_map, 0, sizeof(s_addr_map));
     memset(s_own_cmd, 0, sizeof(s_own_cmd));
     memset(&s_vend, 0, sizeof(s_vend));
+    memset(s_vend_cmd, 0, sizeof(s_vend_cmd));
     /* s_reader_enabled deliberately survives: it records something the VMC
      * did, not a counter, and clearing it would make a mid-session reset of
      * the counters report a reader that is plainly working as never enabled. */
@@ -500,6 +519,17 @@ void mdb_debug_note_unknown_cmd(void) { s_c.unknown_cmd++; }
 void mdb_debug_note_drain(void)       { s_c.drains++; }
 void mdb_debug_note_reader_enabled(void) { s_reader_enabled = true; }
 
+void mdb_debug_note_vend_cmd(uint8_t sub)
+{
+    s_vend_cmd[sub & 0x07]++;
+
+#if TRACE_DEPTH > 0
+    /* Armed once the whole VEND REQUEST block is in the ring, so the frozen
+     * window contains the price bytes themselves plus what we answered. */
+    if (sub == 0x00) snapshot_arm_vend();
+#endif
+}
+
 void mdb_debug_note_vend(uint8_t cmd, uint16_t raw, uint16_t item, uint32_t cents)
 {
     if (s_vend.n == 0 || raw < s_vend.raw_min) s_vend.raw_min = raw;
@@ -599,6 +629,15 @@ size_t mdb_debug_json(char *out, size_t cap)
     n = appendf(out, cap, n, ",\"scale\":{\"sf\":%u,\"dp\":%u}",
                 (unsigned) CONFIG_MDB_SCALE_FACTOR,
                 (unsigned) CONFIG_MDB_DECIMAL_PLACES);
+
+    if (s_vend_cmd[0] || s_vend_cmd[5]) {
+        n = appendf(out, cap, n,
+            ",\"vendCmd\":{\"req\":%lu,\"cancel\":%lu,\"succ\":%lu,\"fail\":%lu"
+            ",\"done\":%lu,\"cash\":%lu}",
+            (unsigned long) s_vend_cmd[0], (unsigned long) s_vend_cmd[1],
+            (unsigned long) s_vend_cmd[2], (unsigned long) s_vend_cmd[3],
+            (unsigned long) s_vend_cmd[4], (unsigned long) s_vend_cmd[5]);
+    }
 
     if (s_vend.n) {
         n = appendf(out, cap, n,
